@@ -1817,13 +1817,13 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
     weight_scale_ = register_parameter(
         "weight_scale",
         torch::empty({groups_per_rank_, out_features_per_group},
-                     torch::options().dtype(torch::kFloat32).device(device_)),
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
         /*requires_grad=*/false);
     if (quant_args_.quant_descs().empty()) {
       weight_offset_ = register_parameter(
           "weight_offset",
           torch::empty({groups_per_rank_, out_features_per_group},
-                       torch::options().dtype(torch::kInt8).device(device_)),
+                       torch::TensorOptions().dtype(torch::kInt8).device(device_)),
           /*requires_grad=*/false);
     }
   }
@@ -1895,24 +1895,37 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
         << "input_offset is required for w8a8 quant matmul.";
     CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
         << "deq_scale is required for w8a8 quant matmul.";
-    auto output = atb_speed::quant::w8a8_quant_matmul(input,
-                                                       weight_,
-                                                       input_scale_,
-                                                       input_offset_,
-                                                       deq_scale_,
-                                                       quant_bias_,
-                                                       bias,
-                                                       output_dtype_);
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+    output = npu_w8a8_linear_forward(input,
+                                     weight_,
+                                     input_scale_,
+                                     input_offset_,
+                                     deq_scale_,
+                                     quant_bias,
+                                     output_dtype_);
     return output;
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
-        << "weight_scale is required for w8a8 dynamic quant matmul.";
-    auto output = atb_speed::quant::w8a8_dynamic_quant_matmul(
-        input, weight_, weight_scale_, bias, output_dtype_);
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+#if defined(USE_DCU)
+    output = dcu_w8a8_dynamic_linear_forward(
+        input, weight_, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+    output = npu_w8a8_dynamic_linear_forward(
+        input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
     return output;
   } else {
-    return torch::matmul(input, weight_.transpose(1, 2)) +
-           (bias.has_value() ? bias.value() : 0);
+    output = torch::matmul(input, weight_.transpose(1, 2));
+    if (bias.has_value()) {
+      output = output + bias.value();
+    }
+    return output;
   }
 }
 
