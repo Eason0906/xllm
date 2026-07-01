@@ -99,6 +99,11 @@ class DSAttentionImpl : public torch::nn::Module {
   int64_t index_head_dim_ = 0;
   int64_t index_topk_ = 0;
 
+  int64_t otp_rank_ = 0;
+  int64_t otp_size_ = 1;
+  bool otp_enabled_ = false;
+  ProcessGroup* otp_group_ = nullptr;
+
   double rope_theta_ = 10000.0;
   double compress_rope_theta_ = 40000.0;
 
@@ -112,6 +117,9 @@ class DSAttentionImpl : public torch::nn::Module {
   ColumnParallelLinear o_a_proj_{nullptr};
   RowParallelLinear o_b_proj_{nullptr};
 
+  OTPColumnParallelLinear o_a_proj_otp_{nullptr};
+  RowParallelLinear o_b_proj_otp_{nullptr};
+
   torch::Tensor attn_sink_;
   bool attn_sink_loaded_ = false;
 
@@ -121,6 +129,8 @@ class DSAttentionImpl : public torch::nn::Module {
   Compressor compressor_{nullptr};
 
   torch::Tensor q_rms_gamma_;
+  torch::Tensor all_to_all_buffer_;
+  torch::Tensor reduce_scatter_buffer_;
 };
 TORCH_MODULE(DSAttention);
 

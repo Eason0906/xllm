@@ -86,6 +86,8 @@ class ParallelConfig final {
 
   PROPERTY(bool, enable_dp_balance) = false;
 
+  PROPERTY(int32_t, otp_size) = 1;
+
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
   }

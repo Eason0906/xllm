@@ -440,6 +440,25 @@ void CollectiveCommunicator::create_process_groups(
     parallel_args_->moe_ep_group_ = moe_ep_group_.get();
   }
 
+  int32_t otp_size = ::xllm::ParallelConfig::get_instance().otp_size();
+  parallel_args_->otp_size(otp_size);
+  if (otp_size > 1) {
+    CHECK_EQ(world_size % otp_size, 0)
+        << "world_size " << world_size << " must be divisible by otp_size " << otp_size;
+    const int32_t otp_group_size = tp_size;
+    port_offset = global_rank % otp_group_size + 1;
+    otp_group_ = create_process_group(global_rank,
+                                      world_size,
+                                      otp_size,
+                                      port + port_offset,
+                                      false,
+                                      host,
+                                      "otp_group",
+                                      device);
+    parallel_args_->otp_group_ = otp_group_.get();
+    port += otp_group_size;
+  }
+
 #if defined(USE_NPU)
   if (::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&
       ::xllm::EPLBConfig::get_instance().expert_parallel_degree() == 2 &&

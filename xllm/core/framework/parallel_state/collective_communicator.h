@@ -47,6 +47,7 @@ class CollectiveCommunicator : public CollectiveCommunicatorBase {
   std::unique_ptr<ProcessGroup> sp_group_;
   std::unique_ptr<ProcessGroup> moe_tp_group_;
   std::unique_ptr<ProcessGroup> moe_ep_group_;
+  std::unique_ptr<ProcessGroup> otp_group_;
 };
 
 }  // namespace xllm

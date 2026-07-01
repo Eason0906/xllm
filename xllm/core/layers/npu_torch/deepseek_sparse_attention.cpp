@@ -501,12 +501,24 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
   int64_t hidden_size = args.hidden_size();
   int64_t num_heads = args.n_heads();
 
+  otp_size_ = parallel_args.otp_size();
+  otp_rank_ = parallel_args.otp_rank();
+  otp_group_ = parallel_args.otp_group_;
+  otp_enabled_ = (otp_size_ > 1);
+
   CHECK_EQ(o_groups_ % tp_size, 0)
       << "o_groups must be divisible by tensor parallel size";
   CHECK_EQ(num_heads % tp_size, 0)
       << "num_heads must be divisible by tensor parallel size";
   n_local_heads_ = num_heads / tp_size;
   n_local_groups_ = o_groups_ / tp_size;
+
+  if (otp_enabled_) {
+    CHECK_EQ(o_groups_ % otp_size_, 0)
+        << "o_groups must be divisible by otp_size";
+    CHECK_EQ(hidden_size % otp_size_, 0)
+        << "hidden_size must be divisible by otp_size";
+  }
 
   attn_sink_ = register_parameter(
       "attn_sink",
@@ -605,6 +617,29 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
                                                 quant_args,
                                                 parallel_args.tp_group_,
                                                 options));
+
+  if (otp_enabled_) {
+    o_a_proj_otp_ = register_module(
+        "o_a_proj_otp",
+        OTPColumnParallelLinear(num_heads * head_dim_ / o_groups_,
+                                o_lora_rank_,
+                                o_groups_,
+                                false,
+                                quant_args,
+                                otp_group_,
+                                options));
+
+    o_b_proj_otp_ = register_module(
+        "o_b_proj_otp",
+        RowParallelLinear(o_groups_ * o_lora_rank_,
+                          hidden_size,
+                          false,
+                          /*input_is_parallelized=*/true,
+                          /*enable_result_reduction=*/false,
+                          quant_args,
+                          otp_group_,
+                          options));
+  }
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>>
@@ -867,9 +902,34 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
-  auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
-  auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
-  auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+
+  torch::Tensor output;
+  if (otp_enabled_) {
+    auto wo_a = o_a_proj_otp_->weight().view({n_local_groups_, o_lora_rank_, -1});
+    auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+
+    const int64_t local_dim = o_low_rank.size(-1);
+    const int64_t total_dim = local_dim * otp_size_;
+
+    all_to_all_buffer_ =
+        torch::empty({num_tokens, n_local_groups_, total_dim},
+                     o_low_rank.options());
+    otp_group_->all_to_all_single(all_to_all_buffer_, o_low_rank);
+
+    auto o_low_rank_all = all_to_all_buffer_.view({num_tokens, -1});
+    output = o_b_proj_otp_->forward(o_low_rank_all);
+
+    reduce_scatter_buffer_ =
+        torch::empty({num_tokens, head_dim_ * n_local_heads_ / otp_size_},
+                     output.options());
+    otp_group_->reduce_scatter(output, reduce_scatter_buffer_);
+    output = reduce_scatter_buffer_;
+  } else {
+    auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
+    auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+    output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  }
+
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 
@@ -885,6 +945,11 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
   kv_layernorm_->load_state_dict(state_dict.get_dict_with_prefix("kv_norm."));
   o_a_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
   o_b_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+
+  if (otp_enabled_) {
+    o_a_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
+    o_b_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+  }
 
   auto attn_sink = state_dict.get_tensor("attn_sink");
   if (!attn_sink.defined()) {

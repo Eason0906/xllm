@@ -71,6 +71,13 @@ DEFINE_bool(
     "Whether to enable dp load balance, if true, sequences within a single "
     "dp batch will be shuffled.");
 
+DEFINE_int32(otp_size,
+             1,
+             "OTP (o_proj tensor parallel) size for DeepSeek-V4 DSA. "
+             "When > 1, o_proj (wo_a/wo_b) uses an independent parallel group "
+             "orthogonal to TP, enabling finer-grained parallelism for "
+             "the output projection. Must divide world_size.");
+
 namespace xllm {
 
 void ParallelConfig::from_flags() {
@@ -88,6 +95,7 @@ void ParallelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dp_balance);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(otp_size);
 }
 
 void ParallelConfig::from_json(const JsonReader& json) {
@@ -104,6 +112,7 @@ void ParallelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dp_balance);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(otp_size);
 }
 
 void ParallelConfig::append_config_json(
@@ -130,6 +139,7 @@ void ParallelConfig::append_config_json(
       config_json, default_config, micro_batch_num);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dp_balance);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, otp_size);
 }
 
 ParallelConfig& ParallelConfig::get_instance() {

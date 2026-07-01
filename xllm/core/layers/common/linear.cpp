@@ -1737,5 +1737,189 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
   }
 }
 
+OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
+    int64_t in_features,
+    int64_t out_features,
+    int64_t num_groups,
+    bool bias,
+    const QuantArgs& quant_args,
+    ProcessGroup* process_group,
+    const torch::TensorOptions& options)
+    : device_(options.device()),
+      process_group_(process_group),
+      quant_args_(quant_args),
+      options_(options),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+  rank_ = process_group_->rank();
+  world_size_ = process_group_->world_size();
+  num_groups_ = num_groups;
+  CHECK(num_groups % world_size_ == 0)
+      << "num_groups " << num_groups << " not divisible by world_size "
+      << world_size_;
+  groups_per_rank_ = num_groups / world_size_;
+
+  const int64_t out_features_per_group = out_features / num_groups;
+  if (!quant_args_.quant_descs().empty() ||
+      quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+  } else {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options),
+        /*requires_grad=*/false);
+  }
+
+  if (bias) {
+    bias_ = register_parameter(
+        "bias",
+        torch::empty({groups_per_rank_, out_features_per_group}, options),
+        /*requires_grad=*/false);
+  }
+
+  resolved_weight_quant_method_ =
+      resolve_weight_quant_method(quant_args_.quant_descs());
+
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     torch::options().dtype(torch::kFloat32).device(device_)),
+        /*requires_grad=*/false);
+    if (quant_args_.quant_descs().empty()) {
+      weight_offset_ = register_parameter(
+          "weight_offset",
+          torch::empty({groups_per_rank_, out_features_per_group},
+                       torch::options().dtype(torch::kInt8).device(device_)),
+          /*requires_grad=*/false);
+    }
+  }
+}
+
+torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
+  auto bias =
+      bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    auto output = atb_speed::quant::w8a8_quant_matmul(input,
+                                                       weight_,
+                                                       input_scale_,
+                                                       input_offset_,
+                                                       deq_scale_,
+                                                       quant_bias_,
+                                                       bias,
+                                                       output_dtype_);
+    return output;
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+        << "weight_scale is required for w8a8 dynamic quant matmul.";
+    auto output = atb_speed::quant::w8a8_dynamic_quant_matmul(
+        input, weight_, weight_scale_, bias, output_dtype_);
+    return output;
+  } else {
+    return torch::matmul(input, weight_.transpose(1, 2)) +
+           (bias.has_value() ? bias.value() : 0);
+  }
+}
+
+void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
+  auto prefix = name();
+  if (!prefix.empty()) {
+    prefix += ".";
+  }
+
+#define LOAD_SHARDED_WEIGHT(name, dim) \
+  {                                     \
+    auto key = prefix #name;            \
+    if (state_dict.contains(key)) {     \
+      name##_ = state_dict.at(key)      \
+                    .to(device_)        \
+                    .narrow(dim, rank_ * groups_per_rank_, groups_per_rank_); \
+    }                                   \
+  }
+
+#define LOAD_WEIGHT(name)                           \
+  {                                                 \
+    auto key = prefix #name;                        \
+    if (state_dict.contains(key)) {                 \
+      name##_ = state_dict.at(key).to(device_);     \
+    } else if (name##_.defined()) {                 \
+      name##_.zero_();                              \
+    }                                               \
+  }
+
+  if (quant_args_.quant_descs().empty() &&
+      !quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    LOAD_SHARDED_WEIGHT(weight, 0);
+  } else {
+    resolved_weight_quant_method_ =
+        resolve_weight_quant_method(quant_args_.quant_descs());
+    if (is_gptq_quant(resolved_weight_quant_method_)) {
+      LOAD_SHARDED_WEIGHT(qweight, 0);
+      LOAD_SHARDED_WEIGHT(qzeros, 0);
+      LOAD_SHARDED_WEIGHT(scales, 0);
+      qweight_is_loaded_ = true;
+      if (qbias_.defined()) {
+        LOAD_SHARDED_WEIGHT(qbias, 0);
+      }
+    } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+      LOAD_SHARDED_WEIGHT(weight, 0);
+      LOAD_WEIGHT(weight_scale);
+      if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
+        LOAD_WEIGHT(input_scale);
+      }
+    } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+      LOAD_SHARDED_WEIGHT(weight, 0);
+      LOAD_WEIGHT(input_scale);
+      LOAD_WEIGHT(input_offset);
+      LOAD_WEIGHT(deq_scale);
+      if (rank_ == 0) {
+        LOAD_WEIGHT(quant_bias);
+      } else if (quant_bias_.defined()) {
+        quant_bias_.zero_();
+        quant_bias_is_loaded_ = true;
+      }
+    } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+      LOAD_SHARDED_WEIGHT(weight, 0);
+      LOAD_WEIGHT(weight_scale);
+      if (weight_offset_.defined()) {
+        LOAD_WEIGHT(weight_offset);
+      }
+    }
+  }
+
+  if (bias_.defined()) {
+    LOAD_SHARDED_WEIGHT(bias, 0);
+  }
+
+#undef LOAD_SHARDED_WEIGHT
+#undef LOAD_WEIGHT
+}
+
+bool OTPColumnParallelLinearImpl::uses_w8a8_dynamic_quant() const {
+  return is_w8a8_dynamic_quant(resolved_weight_quant_method_);
+}
+
+torch::Tensor OTPColumnParallelLinearImpl::w8a8_dynamic_weight_scale() const {
+  return weight_scale_;
+}
+
+at::ScalarType OTPColumnParallelLinearImpl::output_dtype() const {
+  return output_dtype_;
+}
+
+std::optional<torch::Tensor> OTPColumnParallelLinearImpl::bias() const {
+  return bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+}
+
 }  // namespace layer
 }  // namespace xllm
