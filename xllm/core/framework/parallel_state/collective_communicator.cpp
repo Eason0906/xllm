@@ -443,10 +443,11 @@ void CollectiveCommunicator::create_process_groups(
   int32_t otp_size = ::xllm::ParallelConfig::get_instance().otp_size();
   parallel_args_->otp_size(otp_size);
   if (otp_size > 1) {
-    CHECK_EQ(world_size % otp_size, 0)
-        << "world_size " << world_size << " must be divisible by otp_size " << otp_size;
-    const int32_t otp_group_size = tp_size;
-    port_offset = global_rank % otp_group_size + 1;
+    CHECK_EQ(tp_size, 1)
+        << "OTP requires tensor_parallel_size == 1, got " << tp_size;
+    CHECK_EQ(dp_size % otp_size, 0)
+        << "dp_size (" << dp_size << ") must be divisible by otp_size (" << otp_size << ")";
+    port_offset = global_rank % otp_size + 1;
     otp_group_ = create_process_group(global_rank,
                                       world_size,
                                       otp_size,
@@ -456,7 +457,7 @@ void CollectiveCommunicator::create_process_groups(
                                       "otp_group",
                                       device);
     parallel_args_->otp_group_ = otp_group_.get();
-    port += otp_group_size;
+    port += dp_size / otp_size;
   }
 
 #if defined(USE_NPU)

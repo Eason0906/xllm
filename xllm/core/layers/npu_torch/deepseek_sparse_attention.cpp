@@ -905,25 +905,26 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   torch::Tensor output;
   if (otp_enabled_) {
-    auto wo_a = o_a_proj_otp_->weight().view({n_local_groups_, o_lora_rank_, -1});
-    auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+    int64_t groups_per_rank = n_local_groups_ / otp_size_;
+    int64_t group_hidden_dim = o_group.size(-1);
 
-    const int64_t local_dim = o_low_rank.size(-1);
-    const int64_t total_dim = local_dim * otp_size_;
+    auto o_reshaped = o_group.view({num_tokens, otp_size_, groups_per_rank, group_hidden_dim});
+    auto send_buf = o_reshaped.permute({1, 0, 2, 3}).contiguous().view({-1});
 
-    all_to_all_buffer_ =
-        torch::empty({num_tokens, n_local_groups_, total_dim},
-                     o_low_rank.options());
-    otp_group_->all_to_all_single(all_to_all_buffer_, o_low_rank);
+    auto recv_buf = torch::empty(
+        {otp_size_ * num_tokens * groups_per_rank * group_hidden_dim},
+        o_group.options());
+    otp_group_->all_to_all_single(recv_buf, send_buf);
 
-    auto o_low_rank_all = all_to_all_buffer_.view({num_tokens, -1});
-    output = o_b_proj_otp_->forward(o_low_rank_all);
+    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank, group_hidden_dim});
+    auto wo_a = o_a_proj_otp_->weight().view({groups_per_rank, o_lora_rank_, group_hidden_dim});
+    auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_shuffled, wo_a});
 
-    reduce_scatter_buffer_ =
-        torch::empty({num_tokens, head_dim_ * n_local_heads_ / otp_size_},
-                     output.options());
-    otp_group_->reduce_scatter(output, reduce_scatter_buffer_);
-    output = reduce_scatter_buffer_;
+    auto o_flat = o_low_rank.reshape({otp_size_ * num_tokens, -1});
+    auto o_b_output = o_b_proj_otp_->forward(o_flat);
+
+    output = torch::empty({num_tokens, o_b_output.size(-1)}, o_b_output.options());
+    otp_group_->reduce_scatter(o_b_output, output);
   } else {
     auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
     auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
@@ -947,8 +948,31 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
   o_b_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
 
   if (otp_enabled_) {
-    o_a_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
-    o_b_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+    int64_t groups_per_rank = n_local_groups_ / otp_size_;
+
+    auto wo_a_full = state_dict.get_tensor("wo_a.weight");
+    CHECK(wo_a_full.defined()) << "wo_a.weight not found in state_dict";
+    int64_t start_group = otp_rank_ * groups_per_rank;
+    auto wo_a_shard = wo_a_full.slice(/*dim=*/0,
+                                       /*start=*/start_group,
+                                       /*end=*/start_group + groups_per_rank);
+
+    StateDict wo_a_dict;
+    wo_a_dict.set_tensor("weight", wo_a_shard);
+    o_a_proj_otp_->load_state_dict(wo_a_dict);
+
+    auto wo_b_full = state_dict.get_tensor("wo_b.weight");
+    CHECK(wo_b_full.defined()) << "wo_b.weight not found in state_dict";
+    int64_t hidden_size = wo_b_full.size(1);
+    int64_t shard_size = hidden_size / otp_size_;
+    int64_t start_hidden = otp_rank_ * shard_size;
+    auto wo_b_shard = wo_b_full.slice(/*dim=*/1,
+                                       /*start=*/start_hidden,
+                                       /*end=*/start_hidden + shard_size);
+
+    StateDict wo_b_dict;
+    wo_b_dict.set_tensor("weight", wo_b_shard);
+    o_b_proj_otp_->load_state_dict(wo_b_dict);
   }
 
   auto attn_sink = state_dict.get_tensor("attn_sink");
