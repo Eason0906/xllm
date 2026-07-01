@@ -421,6 +421,16 @@ class OTPColumnParallelLinearImpl : public torch::nn::Module {
   DEFINE_WEIGHT(scales);
   DEFINE_WEIGHT(qbias);
 
+  DEFINE_WEIGHT(per_channel_scale);
+  DEFINE_WEIGHT(smooth);
+
+  DEFINE_WEIGHT(input_scale);
+  DEFINE_WEIGHT(input_offset);
+  DEFINE_WEIGHT(deq_scale);
+  DEFINE_WEIGHT(quant_bias);
+  DEFINE_WEIGHT(weight_scale);
+  DEFINE_WEIGHT(weight_offset);
+
   QuantArgs quant_args_;
   torch::TensorOptions options_;
   at::ScalarType output_dtype_;

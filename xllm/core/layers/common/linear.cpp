@@ -1759,8 +1759,40 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
   groups_per_rank_ = num_groups / world_size_;
 
   const int64_t out_features_per_group = out_features / num_groups;
-  if (!quant_args_.quant_descs().empty() ||
-      quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    qweight_ = register_parameter(
+        "qweight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+    per_channel_scale_ = register_parameter(
+        "per_channel_scale",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+    smooth_ = register_parameter(
+        "smooth",
+        torch::empty({in_features}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kFloat8_e4m3fn)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_},
+                     options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+    if (!quant_args_.activation_dynamic()) {
+      input_scale_ = register_parameter(
+          "input_scale",
+          torch::empty({1}, options.dtype(torch::kFloat32)),
+          /*requires_grad=*/false);
+    }
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
     weight_ = register_parameter(
         "weight",
         torch::empty({groups_per_rank_, out_features_per_group, in_features},
@@ -1781,10 +1813,7 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
         /*requires_grad=*/false);
   }
 
-  resolved_weight_quant_method_ =
-      resolve_weight_quant_method(quant_args_.quant_descs());
-
-  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+  if (quant_args_.is_compressed_tensors_w8a8_dynamic()) {
     weight_scale_ = register_parameter(
         "weight_scale",
         torch::empty({groups_per_rank_, out_features_per_group},
@@ -1803,7 +1832,63 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
 torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
-  if (is_w8a8_quant(resolved_weight_quant_method_)) {
+  torch::Tensor output;
+
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    CHECK(qweight_is_loaded_ && qweight_.defined())
+        << "qweight is required for smoothquant.";
+    CHECK(per_channel_scale_is_loaded_ && per_channel_scale_.defined())
+        << "per_channel_scale is required for smoothquant.";
+
+    torch::Tensor quantized_input;
+    torch::Tensor input_scale;
+
+    xllm::kernel::ScaledQuantizeParams quantize_params;
+    quantize_params.x = input;
+    quantize_params.smooth = smooth_;
+    quantize_params.zero = std::nullopt;
+    quantize_params.token_count = std::nullopt;
+    quantize_params.gather_index = std::nullopt;
+    quantize_params.gather_index_start_position = std::nullopt;
+    quantize_params.output = std::nullopt;
+    quantize_params.output_scale = std::nullopt;
+    quantize_params.act_mode = "none";
+    quantize_params.active_coef = 1.0;
+    quantize_params.is_gated = false;
+
+    std::tie(quantized_input, input_scale) =
+        xllm::kernel::scaled_quantize(quantize_params);
+
+    xllm::kernel::ScaledMatmulParams matmul_params;
+    matmul_params.a = quantized_input;
+    matmul_params.b = qweight_;
+    matmul_params.a_scale = input_scale;
+    matmul_params.b_scale = per_channel_scale_;
+    matmul_params.output_dtype = output_dtype_;
+    matmul_params.bias = bias;
+    matmul_params.c = std::nullopt;
+    matmul_params.act_mode = "none";
+    matmul_params.quant_bit_size = 8;
+    matmul_params.alpha = 1.0;
+    matmul_params.beta = 0.0;
+    matmul_params.use_hp_active = false;
+    matmul_params.a_quant_bit_size = 8;
+    matmul_params.a_calib = std::nullopt;
+    matmul_params.b_calib = std::nullopt;
+    matmul_params.output = std::nullopt;
+
+    output = xllm::kernel::scaled_matmul(matmul_params);
+    return output;
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+        << "weight_scale is required for fp8 quant matmul.";
+    auto scale = input_scale_is_loaded_ && input_scale_.defined()
+                     ? std::optional<torch::Tensor>(input_scale_)
+                     : std::nullopt;
+    output = fp8_linear_forward(
+        input, weight_, weight_scale_, scale, bias, output_dtype_);
+    return output;
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";
     CHECK(input_offset_is_loaded_ && input_offset_.defined())
@@ -1832,77 +1917,181 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
 }
 
 void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
   auto prefix = name();
   if (!prefix.empty()) {
     prefix += ".";
   }
 
-#define LOAD_SHARDED_WEIGHT(name, dim) \
-  {                                     \
-    auto key = prefix #name;            \
-    if (state_dict.contains(key)) {     \
-      name##_ = state_dict.at(key)      \
-                    .to(device_)        \
-                    .narrow(dim, rank_ * groups_per_rank_, groups_per_rank_); \
-    }                                   \
-  }
+  const int64_t rank = world_size_ == 1 ? 0 : rank_;
+  const int64_t world_size = world_size_;
 
-#define LOAD_WEIGHT(name)                           \
-  {                                                 \
-    auto key = prefix #name;                        \
-    if (state_dict.contains(key)) {                 \
-      name##_ = state_dict.at(key).to(device_);     \
-    } else if (name##_.defined()) {                 \
-      name##_.zero_();                              \
-    }                                               \
-  }
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_});
 
-  if (quant_args_.quant_descs().empty() &&
-      !quant_args_.is_compressed_tensors_w8a8_dynamic()) {
-    LOAD_SHARDED_WEIGHT(weight, 0);
-  } else {
-    resolved_weight_quant_method_ =
-        resolve_weight_quant_method(quant_args_.quant_descs());
-    if (is_gptq_quant(resolved_weight_quant_method_)) {
-      LOAD_SHARDED_WEIGHT(qweight, 0);
-      LOAD_SHARDED_WEIGHT(qzeros, 0);
-      LOAD_SHARDED_WEIGHT(scales, 0);
-      qweight_is_loaded_ = true;
-      if (qbias_.defined()) {
-        LOAD_SHARDED_WEIGHT(qbias, 0);
-      }
-    } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-      LOAD_SHARDED_WEIGHT(weight, 0);
-      LOAD_WEIGHT(weight_scale);
-      if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
-        LOAD_WEIGHT(input_scale);
-      }
-    } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
-      LOAD_SHARDED_WEIGHT(weight, 0);
-      LOAD_WEIGHT(input_scale);
-      LOAD_WEIGHT(input_offset);
-      LOAD_WEIGHT(deq_scale);
-      if (rank_ == 0) {
-        LOAD_WEIGHT(quant_bias);
-      } else if (quant_bias_.defined()) {
-        quant_bias_.zero_();
-        quant_bias_is_loaded_ = true;
-      }
-    } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-      LOAD_SHARDED_WEIGHT(weight, 0);
-      LOAD_WEIGHT(weight_scale);
-      if (weight_offset_.defined()) {
-        LOAD_WEIGHT(weight_offset);
-      }
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "qweight",
+                                0,
+                                rank,
+                                world_size,
+                                qweight_,
+                                qweight_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "per_channel_scale",
+                                0,
+                                rank,
+                                world_size,
+                                per_channel_scale_,
+                                per_channel_scale_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "smooth",
+                        smooth_,
+                        smooth_is_loaded_);
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight",
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "weight_scale",
+                        weight_scale_,
+                        weight_scale_is_loaded_);
+    if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
+      weight::load_weight(state_dict,
+                          prefix + "input_scale",
+                          input_scale_,
+                          input_scale_is_loaded_);
     }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight",
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "input_scale",
+                        input_scale_,
+                        input_scale_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "input_offset",
+                        input_offset_,
+                        input_offset_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "deq_scale",
+                                0,
+                                rank,
+                                world_size,
+                                deq_scale_,
+                                deq_scale_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "quant_bias",
+                                0,
+                                rank,
+                                world_size,
+                                quant_bias_,
+                                quant_bias_is_loaded_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight",
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight_scale",
+                                0,
+                                rank,
+                                world_size,
+                                weight_scale_,
+                                weight_scale_is_loaded_);
+    if (weight_offset_.defined()) {
+      weight::load_sharded_weight(state_dict,
+                                  prefix + "weight_offset",
+                                  0,
+                                  rank,
+                                  world_size,
+                                  weight_offset_,
+                                  weight_offset_is_loaded_);
+    }
+  } else if (is_gptq_quant(resolved_weight_quant_method_)) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "qweight",
+                                0,
+                                rank,
+                                world_size,
+                                qweight_,
+                                qweight_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "qzeros",
+                                0,
+                                rank,
+                                world_size,
+                                qzeros_,
+                                qzeros_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "scales",
+                                0,
+                                rank,
+                                world_size,
+                                scales_,
+                                scales_is_loaded_);
+    if (qbias_.defined()) {
+      weight::load_sharded_weight(state_dict,
+                                  prefix + "qbias",
+                                  0,
+                                  rank,
+                                  world_size,
+                                  qbias_,
+                                  qbias_is_loaded_);
+    }
+  } else {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight",
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
   }
 
   if (bias_.defined()) {
-    LOAD_SHARDED_WEIGHT(bias, 0);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "bias",
+                                0,
+                                rank,
+                                world_size,
+                                bias_,
+                                bias_is_loaded_);
   }
-
-#undef LOAD_SHARDED_WEIGHT
-#undef LOAD_WEIGHT
 }
 
 bool OTPColumnParallelLinearImpl::uses_w8a8_dynamic_quant() const {
