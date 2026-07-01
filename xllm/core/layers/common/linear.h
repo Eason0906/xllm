@@ -420,7 +420,6 @@ class OTPColumnParallelLinearImpl : public torch::nn::Module {
   DEFINE_WEIGHT(qzeros);
   DEFINE_WEIGHT(scales);
   DEFINE_WEIGHT(qbias);
-  bool qweight_is_loaded_ = false;
 
   QuantArgs quant_args_;
   torch::TensorOptions options_;
