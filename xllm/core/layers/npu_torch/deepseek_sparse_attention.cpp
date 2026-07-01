@@ -957,8 +957,9 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
                                        /*start=*/start_group,
                                        /*end=*/start_group + groups_per_rank);
 
-    StateDict wo_a_dict;
-    wo_a_dict.set_tensor("weight", wo_a_shard);
+    std::unordered_map<std::string, torch::Tensor> wo_a_dict_map;
+    wo_a_dict_map["weight"] = wo_a_shard;
+    StateDict wo_a_dict(wo_a_dict_map);
     o_a_proj_otp_->load_state_dict(wo_a_dict);
 
     auto wo_b_full = state_dict.get_tensor("wo_b.weight");
@@ -970,8 +971,9 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
                                        /*start=*/start_hidden,
                                        /*end=*/start_hidden + shard_size);
 
-    StateDict wo_b_dict;
-    wo_b_dict.set_tensor("weight", wo_b_shard);
+    std::unordered_map<std::string, torch::Tensor> wo_b_dict_map;
+    wo_b_dict_map["weight"] = wo_b_shard;
+    StateDict wo_b_dict(wo_b_dict_map);
     o_b_proj_otp_->load_state_dict(wo_b_dict);
   }
 
