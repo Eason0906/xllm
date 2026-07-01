@@ -245,6 +245,12 @@ bool is_w8a8_quant(
          resolved_weight_quant_method.value() == "w8a8";
 }
 
+bool is_gptq_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  return resolved_weight_quant_method.has_value() &&
+         resolved_weight_quant_method.value() == "gptq";
+}
+
 torch::Dtype get_w8a8_deq_scale_dtype(const torch::TensorOptions& options) {
   const torch::Dtype dtype = c10::typeMetaToScalarType(options.dtype());
   if (dtype == torch::kFloat16) {
