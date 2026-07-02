@@ -438,6 +438,7 @@ void CollectiveCommunicator::create_process_groups(
                                          "moe_ep_group",
                                          device);
     parallel_args_->moe_ep_group_ = moe_ep_group_.get();
+    port += ep_size;
   }
 
   int32_t otp_size = ::xllm::ParallelConfig::get_instance().otp_size();
