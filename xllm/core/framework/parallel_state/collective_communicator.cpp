@@ -392,7 +392,11 @@ void CollectiveCommunicator::create_process_groups(
 
   if (dp_size > 1) {
     if (tp_size == 1) {
-      port_offset = global_rank + 1;
+      // When tp_size == 1, dp_size == world_size. In this case, the trans=true
+      // dp_group has trans_group_size=1, meaning each rank gets a unique
+      // local_rank. Since only local_rank==0 creates the TCPStore server, all
+      // ranks must share the same port to avoid connection timeouts.
+      port_offset = 1;
       dp_local_process_group_ = create_process_group(global_rank,
                                                      world_size,
                                                      dp_size,
