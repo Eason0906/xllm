@@ -391,7 +391,7 @@ void CollectiveCommunicator::create_process_groups(
   port += dp_size + single_rank_group_port_gap + single_rank_group_count;
 
   if (dp_size > 1) {
-    port_offset = global_rank % tp_size + 1;
+    port_offset = global_rank / tp_size + 1;
     dp_local_process_group_ = create_process_group(global_rank,
                                                    world_size,
                                                    dp_size,
@@ -401,7 +401,7 @@ void CollectiveCommunicator::create_process_groups(
                                                    "dp_group",
                                                    device);
     parallel_args_->dp_local_process_group_ = dp_local_process_group_.get();
-    port += tp_size;
+    port += dp_size;
   }
 
   int32_t moe_tp_size = world_size / ep_size;
