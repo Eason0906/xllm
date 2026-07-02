@@ -446,7 +446,21 @@ void CollectiveCommunicator::create_process_groups(
                                          device);
     parallel_args_->moe_tp_group_ = moe_tp_group_.get();
     port += ep_size;
-    port_offset = global_rank % moe_tp_size + 1;
+    // When moe_tp_size == 1, we have ep_size == world_size and trans_group_size=1.
+    // In this case, all ranks belong to the same transposed group but get different
+    // local_rank values. However, TCPStore requires all ranks to use the same port
+    // to connect to the same store. Using a fixed port_offset=1 ensures all ranks
+    // in this scenario share the same port, regardless of world_size.
+    // This is correct because:
+    // 1. 'port' is cumulative across process groups (not global rank-specific)
+    // 2. port_offset=1 means all ranks use (base_port + 1), ensuring they connect
+    //    to the same TCPStore instance
+    // 3. This works for any world_size since it's a relative offset, not absolute
+    if (moe_tp_size == 1) {
+      port_offset = 1;
+    } else {
+      port_offset = global_rank % moe_tp_size + 1;
+    }
     moe_ep_group_ = create_process_group(global_rank,
                                          world_size,
                                          ep_size,
