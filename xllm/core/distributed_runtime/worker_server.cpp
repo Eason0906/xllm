@@ -172,12 +172,24 @@ void WorkerServer::create_server(const runtime::Options& options,
     comm = std::move(common_comm);
   }
 
-  comm->create_process_groups(master_node_addr, device);
-  parallel_args = comm->parallel_args();
+  try {
+    comm->create_process_groups(master_node_addr, device);
+    parallel_args = comm->parallel_args();
 
-  std::unique_ptr<Worker> worker =
-      std::make_unique<Worker>(*parallel_args, device, options, worker_type);
-  worker_service->set_worker(std::move(worker));
+    std::unique_ptr<Worker> worker =
+        std::make_unique<Worker>(*parallel_args, device, options, worker_type);
+    worker_service->set_worker(std::move(worker));
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Worker#" << worker_global_rank
+               << " failed to create process groups or initialize worker: "
+               << e.what();
+    return;
+  } catch (...) {
+    LOG(ERROR) << "Worker#" << worker_global_rank
+               << " failed to create process groups or initialize worker: "
+                  "unknown error";
+    return;
+  }
   bool create_shm =
       options.enable_shm() && input_shm_manager && output_shm_manager;
   if (create_shm) {
