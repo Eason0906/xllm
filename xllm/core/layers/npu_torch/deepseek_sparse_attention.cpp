@@ -944,8 +944,15 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
 
   kv_proj_->load_state_dict(state_dict.get_dict_with_prefix("wkv."));
   kv_layernorm_->load_state_dict(state_dict.get_dict_with_prefix("kv_norm."));
-  o_a_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
-  o_b_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+
+  // When OTP is enabled, load weights into OTP-specific projections (o_a_proj_otp_, o_b_proj_otp_)
+  // instead of the standard projections (o_a_proj_, o_b_proj_). This avoids weight size mismatches
+  // since OTP projections use otp_group_ (world_size=otp_size) while standard projections use
+  // tp_group_ (world_size=1 when tp_size=1).
+  if (!otp_enabled_) {
+    o_a_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
+    o_b_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+  }
 
   if (otp_enabled_) {
     int64_t groups_per_rank = n_local_groups_ / otp_size_;
