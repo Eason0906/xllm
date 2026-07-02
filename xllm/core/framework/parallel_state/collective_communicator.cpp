@@ -447,7 +447,7 @@ void CollectiveCommunicator::create_process_groups(
         << "OTP requires tensor_parallel_size == 1, got " << tp_size;
     CHECK_EQ(dp_size % otp_size, 0)
         << "dp_size (" << dp_size << ") must be divisible by otp_size (" << otp_size << ")";
-    port_offset = global_rank % otp_size + 1;
+    port_offset = global_rank / otp_size + 1;
     otp_group_ = create_process_group(global_rank,
                                       world_size,
                                       otp_size,
