@@ -299,7 +299,8 @@ void ensure_w8a8_params_for_linear_load(
   };
 
   if (!is_w8a8_quant(resolved_weight_quant_method) &&
-      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
+      !is_w8a8_dynamic_quant(resolved_weight_quant_method) &&
+      quant_args.quant_method() != kQuantMethodAscendInt8) {
     if (!quant_args.quant_descs().empty() ||
         quant_args.is_compressed_tensors_w8a8_dynamic()) {
       // Quant args indicated a checkpoint that may be quantized, so the
@@ -334,7 +335,8 @@ void ensure_w8a8_params_for_linear_load(
   }
 
   specs.reserve(4);
-  if (is_w8a8_quant(resolved_weight_quant_method)) {
+  if (is_w8a8_quant(resolved_weight_quant_method) ||
+      quant_args.quant_method() == kQuantMethodAscendInt8) {
     push(refs.input_scale,
          refs.input_scale_is_loaded,
          "input_scale",
@@ -1946,6 +1948,41 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
           input, weight_, weight_scale_, scale, bias, output_dtype_);
     }
     return output;
+  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] AscendInt8 branch";
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for ascend_int8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for ascend_int8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for ascend_int8 quant matmul.";
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+
+      auto output_2d = npu_w8a8_linear_forward(input_2d,
+                                               weight_2d,
+                                               input_scale_,
+                                               input_offset_,
+                                               deq_scale_,
+                                               quant_bias,
+                                               output_dtype_);
+
+      output = output_2d.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = npu_w8a8_linear_forward(input,
+                                       weight_,
+                                       input_scale_,
+                                       input_offset_,
+                                       deq_scale_,
+                                       quant_bias,
+                                       output_dtype_);
+    }
+    return output;
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 branch";
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
@@ -2102,6 +2139,36 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           input_scale_,
                           input_scale_is_loaded_);
     }
+  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    weight::load_sharded_weight(state_dict,
+                                prefix + "weight",
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "input_scale",
+                        input_scale_,
+                        input_scale_is_loaded_);
+    weight::load_weight(state_dict,
+                        prefix + "input_offset",
+                        input_offset_,
+                        input_offset_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "deq_scale",
+                                0,
+                                rank,
+                                world_size,
+                                deq_scale_,
+                                deq_scale_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                prefix + "quant_bias",
+                                0,
+                                rank,
+                                world_size,
+                                quant_bias_,
+                                quant_bias_is_loaded_);
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
                                 prefix + "weight",
