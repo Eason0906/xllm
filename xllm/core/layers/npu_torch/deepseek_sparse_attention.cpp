@@ -955,33 +955,8 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
   }
 
   if (otp_enabled_) {
-    int64_t groups_per_rank = n_local_groups_ / otp_size_;
-
-    auto wo_a_full = state_dict.get_tensor("wo_a.weight");
-    CHECK(wo_a_full.defined()) << "wo_a.weight not found in state_dict";
-    int64_t start_group = otp_rank_ * groups_per_rank;
-    auto wo_a_shard = wo_a_full.slice(/*dim=*/0,
-                                       /*start=*/start_group,
-                                       /*end=*/start_group + groups_per_rank);
-
-    std::unordered_map<std::string, torch::Tensor> wo_a_dict_map;
-    wo_a_dict_map["weight"] = wo_a_shard;
-    StateDict wo_a_dict(wo_a_dict_map);
-    o_a_proj_otp_->load_state_dict(wo_a_dict);
-
-    auto wo_b_full = state_dict.get_tensor("wo_b.weight");
-    if (!wo_b_full.defined()) {
-      wo_b_full = state_dict.get_tensor("o_b_proj.weight");
-    }
-    if (!wo_b_full.defined()) {
-      wo_b_full = state_dict.get_tensor("o_proj_b.weight");
-    }
-    CHECK(wo_b_full.defined()) << "wo_b.weight not found in state_dict";
-
-    std::unordered_map<std::string, torch::Tensor> wo_b_dict_map;
-    wo_b_dict_map["weight"] = wo_b_full;
-    StateDict wo_b_dict(wo_b_dict_map);
-    o_b_proj_otp_->load_state_dict(wo_b_dict);
+    o_a_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
+    o_b_proj_otp_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
   }
 
   auto attn_sink = state_dict.get_tensor("attn_sink");
