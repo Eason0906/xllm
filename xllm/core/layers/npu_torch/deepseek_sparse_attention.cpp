@@ -619,10 +619,12 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
                                                 options));
 
   if (otp_enabled_) {
+    int64_t groups_per_rank = o_groups_ / otp_size_;
+    int64_t group_hidden_dim = num_heads * head_dim_ / o_groups_;
     o_a_proj_otp_ = register_module(
         "o_a_proj_otp",
-        OTPColumnParallelLinear(num_heads * head_dim_ / o_groups_,
-                                o_lora_rank_,
+        OTPColumnParallelLinear(groups_per_rank * group_hidden_dim,
+                                groups_per_rank * o_lora_rank_,
                                 o_groups_,
                                 false,
                                 quant_args,
@@ -631,7 +633,7 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
 
     o_b_proj_otp_ = register_module(
         "o_b_proj_otp",
-        RowParallelLinear(o_groups_ * o_lora_rank_,
+        RowParallelLinear(groups_per_rank * o_lora_rank_,
                           hidden_size,
                           false,
                           /*input_is_parallelized=*/true,
@@ -916,10 +918,10 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         o_group.options());
     otp_group_->all_to_all_single(recv_buf, send_buf);
 
-    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank * group_hidden_dim});
+    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank, group_hidden_dim});
     auto o_low_rank = o_a_proj_otp_->forward(o_shuffled);
 
-    auto o_b_output = o_b_proj_otp_->forward(o_low_rank);
+    auto o_b_output = o_b_proj_otp_->forward(o_low_rank.reshape({otp_size_ * num_tokens, -1}));
 
     output = torch::empty({num_tokens, o_b_output.size(-1)}, o_b_output.options());
     otp_group_->reduce_scatter(o_b_output, output);
