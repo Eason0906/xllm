@@ -2112,6 +2112,15 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     weight_is_loaded_ = true;
   };
 
+  // Also needed for SmoothQuant/FP8/GPTQ branches (unused for ascend_int8).
+  auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
+    if (t.dim() != 2) return t;
+    const int64_t in_features = t.size(-1);
+    const int64_t groups_times_out = t.numel() / in_features;
+    const int64_t out_per_group = groups_times_out / groups_per_rank_;
+    return t.reshape({groups_per_rank_, out_per_group, in_features});
+  };
+
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     weight::load_sharded_weight(state_dict,
                                 "qweight",
