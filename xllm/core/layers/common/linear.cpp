@@ -2093,12 +2093,23 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   // NOTE: compute target shape from groups_per_rank_ and the tensor itself,
   // NOT from weight_.sizes(), because ensure_w8a8_params_for_linear_load may
   // have re-registered weight_ as 2D (lazy quant fallback path).
-  auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
-    if (t.dim() != 2) return t;
-    const int64_t in_features = t.size(-1);
-    const int64_t groups_times_out = t.numel() / in_features;
-    const int64_t out_per_group = groups_times_out / groups_per_rank_;
-    return t.reshape({groups_per_rank_, out_per_group, in_features});
+  // Also manually load+reshape instead of using reshape_to_3d transform via
+  // load_sharded_weight, because load_sharded_weight checks that the loaded
+  // tensor shape matches weight_.sizes() AFTER the transform — if weight_ was
+  // re-registered as 2D, the check fails even though the reshape is correct.
+  auto load_otp_weight = [this](const StateDict& sd, const std::string& key,
+                                int32_t rank, int32_t wsize) {
+    auto t = sd.get_sharded_tensor(key, 0, rank, wsize);
+    if (!t.defined()) return;
+    CHECK(!weight_is_loaded_)
+        << "weight already loaded for " << sd.prefix() << key;
+    auto reshaped = t.dim() == 2
+                        ? t.reshape({groups_per_rank_,
+                                     t.numel() / (groups_per_rank_ * t.size(-1)),
+                                     t.size(-1)})
+                        : t;
+    weight_.set_data(reshaped.to(weight_.dtype()));
+    weight_is_loaded_ = true;
   };
 
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
@@ -2142,14 +2153,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     // Handles both "w8a8" and "ascend_int8" (static w8a8).
-    weight::load_sharded_weight(state_dict,
-                                "weight",
-                                reshape_to_3d,
-                                0,
-                                rank,
-                                world_size,
-                                weight_,
-                                weight_is_loaded_);
+    load_otp_weight(state_dict, "weight", rank, world_size);
     weight::load_weight(state_dict,
                         "input_scale",
                         input_scale_,
@@ -2173,14 +2177,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 quant_bias_,
                                 quant_bias_is_loaded_);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    weight::load_sharded_weight(state_dict,
-                                "weight",
-                                reshape_to_3d,
-                                0,
-                                rank,
-                                world_size,
-                                weight_,
-                                weight_is_loaded_);
+    load_otp_weight(state_dict, "weight", rank, world_size);
     weight::load_sharded_weight(state_dict,
                                 "weight_scale",
                                 0,
@@ -2230,14 +2227,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                   qbias_is_loaded_);
     }
   } else {
-    weight::load_sharded_weight(state_dict,
-                                "weight",
-                                reshape_to_3d,
-                                0,
-                                rank,
-                                world_size,
-                                weight_,
-                                weight_is_loaded_);
+    load_otp_weight(state_dict, "weight", rank, world_size);
   }
 
   if (bias_.defined()) {
