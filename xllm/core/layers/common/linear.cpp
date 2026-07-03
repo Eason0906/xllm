@@ -1877,6 +1877,14 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
             << " sizes=" << weight_.sizes()
             << " quant_method=" << quant_args_.quant_method();
 
+  // Forward may see resolved_weight_quant_method_ as nullopt if the value was
+  // reset between load_state_dict and forward (e.g. during model re-creation
+  // for graph capture). Re-apply the same fallback as load_state_dict.
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8 &&
+      !resolved_weight_quant_method_.has_value()) {
+    resolved_weight_quant_method_ = "ascend_int8";
+  }
+
   bool is_3d = input.dim() == 3 && weight_.dim() == 3;
   int64_t batch = 0;
   int64_t groups_per_rank = 0;
@@ -2108,7 +2116,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                      t.numel() / (groups_per_rank_ * t.size(-1)),
                                      t.size(-1)})
                         : t;
-    weight_.set_data(reshaped.to(weight_.dtype()));
+    weight_.set_data(reshaped.to(weight_.dtype()).to(device_));
     weight_is_loaded_ = true;
   };
 
