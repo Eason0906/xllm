@@ -1962,34 +1962,6 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
           input, weight_, weight_scale_, scale, bias, output_dtype_);
     }
     return output;
-  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
-    LOG(INFO) << "[OTPColumnParallelLinear::forward] AscendInt8 branch";
-    auto weight_scale = weight_scale_is_loaded_
-                            ? std::optional<torch::Tensor>(weight_scale_)
-                            : std::nullopt;
-    CHECK(weight_scale.has_value() && weight_scale.value().defined())
-        << "weight_scale is required for ascend_int8 quant matmul.";
-    if (is_3d) {
-      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
-      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
-#if defined(USE_DCU)
-      output = dcu_w8a8_dynamic_linear_forward(
-          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
-#elif defined(USE_NPU)
-      output = npu_w8a8_dynamic_linear_forward(
-          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
-#endif
-      output = output.reshape({batch, groups_per_rank, out_features_per_group});
-    } else {
-#if defined(USE_DCU)
-      output = dcu_w8a8_dynamic_linear_forward(
-          input, weight_, weight_scale.value(), bias, output_dtype_);
-#elif defined(USE_NPU)
-      output = npu_w8a8_dynamic_linear_forward(
-          input, weight_, weight_scale.value(), bias, output_dtype_);
-#endif
-    }
-    return output;
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 branch";
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
@@ -2085,10 +2057,6 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
 
-  if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
-    resolved_weight_quant_method_ = "w8a8_dynamic";
-  }
-
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
@@ -2113,6 +2081,8 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   // OTPColumnParallelLinear stores weights as 3D [groups_per_rank,
   // out_features_per_group, in_features], but checkpoints store them as
   // standard 2D [out_features, in_features]. Reshape after loading.
+  // Must happen before ensure_w8a8_params_for_linear_load so the lazy param
+  // registration sees the correct out_features (= prod of first two dims).
   auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
     return t.reshape(weight_.sizes());
   };
@@ -2156,30 +2126,8 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           input_scale_,
                           input_scale_is_loaded_);
     }
-  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
-    weight::load_sharded_weight(state_dict,
-                                "weight",
-                                reshape_to_3d,
-                                0,
-                                rank,
-                                world_size,
-                                weight_,
-                                weight_is_loaded_);
-    weight::load_sharded_weight(state_dict,
-                                "weight_scale",
-                                0,
-                                rank,
-                                world_size,
-                                weight_scale_,
-                                weight_scale_is_loaded_);
-    weight::load_sharded_weight(state_dict,
-                                "weight_offset",
-                                0,
-                                rank,
-                                world_size,
-                                weight_offset_,
-                                weight_offset_is_loaded_);
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    // Handles both "w8a8" and "ascend_int8" (static w8a8).
     weight::load_sharded_weight(state_dict,
                                 "weight",
                                 reshape_to_3d,
