@@ -971,15 +971,9 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
 
     auto wo_b_full = state_dict.get_tensor("wo_b.weight");
     CHECK(wo_b_full.defined()) << "wo_b.weight not found in state_dict";
-    int64_t hidden_size = wo_b_full.size(1);
-    int64_t shard_size = hidden_size / otp_size_;
-    int64_t start_hidden = otp_rank_ * shard_size;
-    auto wo_b_shard = wo_b_full.slice(/*dim=*/1,
-                                       /*start=*/start_hidden,
-                                       /*end=*/start_hidden + shard_size);
 
     std::unordered_map<std::string, torch::Tensor> wo_b_dict_map;
-    wo_b_dict_map["weight"] = wo_b_shard;
+    wo_b_dict_map["weight"] = wo_b_full;
     StateDict wo_b_dict(wo_b_dict_map);
     o_b_proj_otp_->load_state_dict(wo_b_dict);
   }
