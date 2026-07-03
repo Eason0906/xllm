@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash(cd D:\\code\\xllm && git diff HEAD~1..HEAD --name-only 2>/dev/null || echo \"no previous commit available\")", "Bash(cd /d/code/xllm && git log --oneline -20)", "Bash(cd /d/code/xllm && git diff HEAD~1..HEAD --stat)"]

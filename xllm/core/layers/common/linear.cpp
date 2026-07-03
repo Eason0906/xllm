@@ -2110,9 +2110,17 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           weight_offset_,
                           weight_offset_is_loaded_});
 
+  // OTPColumnParallelLinear stores weights as 3D [groups_per_rank,
+  // out_features_per_group, in_features], but checkpoints store them as
+  // standard 2D [out_features, in_features]. Reshape after loading.
+  auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
+    return t.reshape(weight_.sizes());
+  };
+
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     weight::load_sharded_weight(state_dict,
                                 "qweight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2132,6 +2140,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     weight::load_sharded_weight(state_dict,
                                 "weight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2150,6 +2159,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
     weight::load_sharded_weight(state_dict,
                                 "weight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2172,6 +2182,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
                                 "weight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2202,6 +2213,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
                                 "weight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2226,6 +2238,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_gptq_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
                                 "qweight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
@@ -2257,6 +2270,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else {
     weight::load_sharded_weight(state_dict,
                                 "weight",
+                                reshape_to_3d,
                                 0,
                                 rank,
                                 world_size,
