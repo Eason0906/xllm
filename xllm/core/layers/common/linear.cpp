@@ -299,8 +299,7 @@ void ensure_w8a8_params_for_linear_load(
   };
 
   if (!is_w8a8_quant(resolved_weight_quant_method) &&
-      !is_w8a8_dynamic_quant(resolved_weight_quant_method) &&
-      quant_args.quant_method() != kQuantMethodAscendInt8) {
+      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
     if (!quant_args.quant_descs().empty() ||
         quant_args.is_compressed_tensors_w8a8_dynamic()) {
       // Quant args indicated a checkpoint that may be quantized, so the
@@ -335,8 +334,7 @@ void ensure_w8a8_params_for_linear_load(
   }
 
   specs.reserve(4);
-  if (is_w8a8_quant(resolved_weight_quant_method) ||
-      quant_args.quant_method() == kQuantMethodAscendInt8) {
+  if (is_w8a8_quant(resolved_weight_quant_method)) {
     push(refs.input_scale,
          refs.input_scale_is_loaded,
          "input_scale",
@@ -2081,6 +2079,11 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
 
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    resolved_weight_quant_method_ = "w8a8";
+  }
+
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
