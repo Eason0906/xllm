@@ -1882,7 +1882,14 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
   // for graph capture). Re-apply the same fallback as load_state_dict.
   if (quant_args_.quant_method() == kQuantMethodAscendInt8 &&
       !resolved_weight_quant_method_.has_value()) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved is nullopt, forcing to ascend_int8";
     resolved_weight_quant_method_ = "ascend_int8";
+  } else if (resolved_weight_quant_method_.has_value()) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved="
+              << resolved_weight_quant_method_.value();
+  } else {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved=nullopt, quant_method="
+              << quant_args_.quant_method();
   }
 
   bool is_3d = input.dim() == 3 && weight_.dim() == 3;
@@ -2036,10 +2043,11 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
   } else {
     LOG(INFO) << "[OTPColumnParallelLinear::forward] Fallback branch";
     if (is_3d) {
-      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
-      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
-      output = torch::matmul(input_2d, weight_2d.transpose(0, 1));
-      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+      // Per-group matmul: each group's weight [out_per_group, in] applied to
+      // its corresponding input slice.  Equivalent to einsum("tgd,grd->tgr").
+      output = torch::matmul(input.unsqueeze(3),
+                             weight_.unsqueeze(1).transpose(2, 3))
+                   .squeeze(3);
     } else {
       if (weight_.dim() == 3) {
         output = torch::matmul(input, weight_.transpose(1, 2));
