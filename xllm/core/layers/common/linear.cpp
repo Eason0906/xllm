@@ -1820,13 +1820,13 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
         /*requires_grad=*/false);
     weight_scale_ = register_parameter(
         "weight_scale",
-        torch::empty({groups_per_rank_, out_features_per_group},
+        torch::empty({groups_per_rank_ * out_features_per_group},
                      torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
         /*requires_grad=*/false);
     weight_offset_ = register_parameter(
         "weight_offset",
-        torch::empty({groups_per_rank_, out_features_per_group},
-                     torch::TensorOptions().dtype(torch::kInt8).device(device_)),
+        torch::empty({groups_per_rank_ * out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
         /*requires_grad=*/false);
   } else if (!quant_args_.quant_descs().empty() ||
              quant_args_.is_compressed_tensors_w8a8_dynamic()) {
@@ -2078,16 +2078,16 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   if (state_dict.size() == 0) {
     return;
   }
-  auto prefix = name();
-  if (!prefix.empty()) {
-    prefix += ".";
-  }
 
   const int64_t rank = world_size_ == 1 ? 0 : rank_;
   const int64_t world_size = world_size_;
 
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    resolved_weight_quant_method_ = "w8a8_dynamic";
+  }
 
   ensure_w8a8_params_for_linear_load(
       this,
@@ -2112,58 +2112,58 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
 
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "qweight",
+                                "qweight",
                                 0,
                                 rank,
                                 world_size,
                                 qweight_,
                                 qweight_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "per_channel_scale",
+                                "per_channel_scale",
                                 0,
                                 rank,
                                 world_size,
                                 per_channel_scale_,
                                 per_channel_scale_is_loaded_);
     weight::load_weight(state_dict,
-                        prefix + "smooth",
+                        "smooth",
                         smooth_,
                         smooth_is_loaded_);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight",
+                                "weight",
                                 0,
                                 rank,
                                 world_size,
                                 weight_,
                                 weight_is_loaded_);
     weight::load_weight(state_dict,
-                        prefix + "weight_scale",
+                        "weight_scale",
                         weight_scale_,
                         weight_scale_is_loaded_);
     if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
       weight::load_weight(state_dict,
-                          prefix + "input_scale",
+                          "input_scale",
                           input_scale_,
                           input_scale_is_loaded_);
     }
   } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight",
+                                "weight",
                                 0,
                                 rank,
                                 world_size,
                                 weight_,
                                 weight_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight_scale",
+                                "weight_scale",
                                 0,
                                 rank,
                                 world_size,
                                 weight_scale_,
                                 weight_scale_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight_offset",
+                                "weight_offset",
                                 0,
                                 rank,
                                 world_size,
@@ -2171,29 +2171,29 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 weight_offset_is_loaded_);
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight",
+                                "weight",
                                 0,
                                 rank,
                                 world_size,
                                 weight_,
                                 weight_is_loaded_);
     weight::load_weight(state_dict,
-                        prefix + "input_scale",
+                        "input_scale",
                         input_scale_,
                         input_scale_is_loaded_);
     weight::load_weight(state_dict,
-                        prefix + "input_offset",
+                        "input_offset",
                         input_offset_,
                         input_offset_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "deq_scale",
+                                "deq_scale",
                                 0,
                                 rank,
                                 world_size,
                                 deq_scale_,
                                 deq_scale_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "quant_bias",
+                                "quant_bias",
                                 0,
                                 rank,
                                 world_size,
@@ -2201,14 +2201,14 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 quant_bias_is_loaded_);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight",
+                                "weight",
                                 0,
                                 rank,
                                 world_size,
                                 weight_,
                                 weight_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight_scale",
+                                "weight_scale",
                                 0,
                                 rank,
                                 world_size,
@@ -2216,7 +2216,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 weight_scale_is_loaded_);
     if (weight_offset_.defined()) {
       weight::load_sharded_weight(state_dict,
-                                  prefix + "weight_offset",
+                                  "weight_offset",
                                   0,
                                   rank,
                                   world_size,
@@ -2225,21 +2225,21 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else if (is_gptq_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "qweight",
+                                "qweight",
                                 0,
                                 rank,
                                 world_size,
                                 qweight_,
                                 qweight_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "qzeros",
+                                "qzeros",
                                 0,
                                 rank,
                                 world_size,
                                 qzeros_,
                                 qzeros_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "scales",
+                                "scales",
                                 0,
                                 rank,
                                 world_size,
@@ -2247,7 +2247,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 scales_is_loaded_);
     if (qbias_.defined()) {
       weight::load_sharded_weight(state_dict,
-                                  prefix + "qbias",
+                                  "qbias",
                                   0,
                                   rank,
                                   world_size,
@@ -2256,7 +2256,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else {
     weight::load_sharded_weight(state_dict,
-                                prefix + "weight",
+                                "weight",
                                 0,
                                 rank,
                                 world_size,
@@ -2266,7 +2266,7 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
 
   if (bias_.defined()) {
     weight::load_sharded_weight(state_dict,
-                                prefix + "bias",
+                                "bias",
                                 0,
                                 rank,
                                 world_size,
