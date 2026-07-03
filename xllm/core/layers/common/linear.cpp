@@ -322,8 +322,15 @@ void ensure_w8a8_params_for_linear_load(
 
   CHECK(refs.weight.defined())
       << "weight must be registered before lazy quant init";
-  const int64_t out_features = refs.weight.size(0);
-  const int64_t in_features = refs.weight.size(1);
+  int64_t out_features;
+  int64_t in_features;
+  if (refs.weight.dim() == 3) {
+    out_features = refs.weight.size(0) * refs.weight.size(1);
+    in_features = refs.weight.size(2);
+  } else {
+    out_features = refs.weight.size(0);
+    in_features = refs.weight.size(1);
+  }
 
   specs.reserve(4);
   if (is_w8a8_quant(resolved_weight_quant_method)) {
@@ -1904,13 +1911,34 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
                           ? std::optional<torch::Tensor>(quant_bias_)
                           : std::nullopt;
-    output = npu_w8a8_linear_forward(input,
-                                     weight_,
-                                     input_scale_,
-                                     input_offset_,
-                                     deq_scale_,
-                                     quant_bias,
-                                     output_dtype_);
+
+    if (input.dim() == 3 && weight_.dim() == 3) {
+      int64_t batch = input.size(0);
+      int64_t groups_per_rank = input.size(1);
+      int64_t group_hidden_dim = input.size(2);
+      int64_t out_features_per_group = weight_.size(1);
+
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+
+      auto output_2d = npu_w8a8_linear_forward(input_2d,
+                                               weight_2d,
+                                               input_scale_,
+                                               input_offset_,
+                                               deq_scale_,
+                                               quant_bias,
+                                               output_dtype_);
+
+      output = output_2d.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = npu_w8a8_linear_forward(input,
+                                       weight_,
+                                       input_scale_,
+                                       input_offset_,
+                                       deq_scale_,
+                                       quant_bias,
+                                       output_dtype_);
+    }
     return output;
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     auto weight_scale = weight_scale_is_loaded_
