@@ -1847,6 +1847,19 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
   torch::Tensor output;
 
+  bool is_3d = input.dim() == 3 && weight_.dim() == 3;
+  int64_t batch = 0;
+  int64_t groups_per_rank = 0;
+  int64_t group_hidden_dim = 0;
+  int64_t out_features_per_group = 0;
+
+  if (is_3d) {
+    batch = input.size(0);
+    groups_per_rank = input.size(1);
+    group_hidden_dim = input.size(2);
+    out_features_per_group = weight_.size(1);
+  }
+
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     CHECK(qweight_is_loaded_ && qweight_.defined())
         << "qweight is required for smoothquant.";
@@ -1857,7 +1870,12 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     torch::Tensor input_scale;
 
     xllm::kernel::ScaledQuantizeParams quantize_params;
-    quantize_params.x = input;
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      quantize_params.x = input_2d;
+    } else {
+      quantize_params.x = input;
+    }
     quantize_params.smooth = smooth_;
     quantize_params.zero = std::nullopt;
     quantize_params.token_count = std::nullopt;
@@ -1891,6 +1909,9 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     matmul_params.output = std::nullopt;
 
     output = xllm::kernel::scaled_matmul(matmul_params);
+    if (is_3d) {
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    }
     return output;
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
@@ -1898,8 +1919,16 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     auto scale = input_scale_is_loaded_ && input_scale_.defined()
                      ? std::optional<torch::Tensor>(input_scale_)
                      : std::nullopt;
-    output = fp8_linear_forward(
-        input, weight_, weight_scale_, scale, bias, output_dtype_);
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+      output = fp8_linear_forward(
+          input_2d, weight_2d, weight_scale_, scale, bias, output_dtype_);
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = fp8_linear_forward(
+          input, weight_, weight_scale_, scale, bias, output_dtype_);
+    }
     return output;
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
@@ -1912,12 +1941,7 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
                           ? std::optional<torch::Tensor>(quant_bias_)
                           : std::nullopt;
 
-    if (input.dim() == 3 && weight_.dim() == 3) {
-      int64_t batch = input.size(0);
-      int64_t groups_per_rank = input.size(1);
-      int64_t group_hidden_dim = input.size(2);
-      int64_t out_features_per_group = weight_.size(1);
-
+    if (is_3d) {
       auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
       auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
 
@@ -1946,16 +1970,36 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
                             : std::nullopt;
     CHECK(weight_scale.has_value() && weight_scale.value().defined())
         << "weight_scale is required for w8a8_dynamic quant matmul.";
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
 #if defined(USE_DCU)
-    output = dcu_w8a8_dynamic_linear_forward(
-        input, weight_, weight_scale.value(), bias, output_dtype_);
+      output = dcu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
 #elif defined(USE_NPU)
-    output = npu_w8a8_dynamic_linear_forward(
-        input, weight_, weight_scale.value(), bias, output_dtype_);
+      output = npu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
 #endif
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+#if defined(USE_DCU)
+      output = dcu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+      output = npu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
+    }
     return output;
   } else {
-    output = torch::matmul(input, weight_.transpose(1, 2));
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+      output = torch::matmul(input_2d, weight_2d.transpose(0, 1));
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = torch::matmul(input, weight_.transpose(1, 2));
+    }
     if (bias.has_value()) {
       output = output + bias.value();
     }
