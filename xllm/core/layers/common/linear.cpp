@@ -1812,6 +1812,22 @@ OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
           torch::empty({1}, options.dtype(torch::kFloat32)),
           /*requires_grad=*/false);
     }
+  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
+        /*requires_grad=*/false);
+    weight_offset_ = register_parameter(
+        "weight_offset",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kInt8).device(device_)),
+        /*requires_grad=*/false);
   } else if (!quant_args_.quant_descs().empty() ||
              quant_args_.is_compressed_tensors_w8a8_dynamic()) {
     weight_ = register_parameter(
@@ -1948,37 +1964,30 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     return output;
   } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
     LOG(INFO) << "[OTPColumnParallelLinear::forward] AscendInt8 branch";
-    CHECK(input_scale_is_loaded_ && input_scale_.defined())
-        << "input_scale is required for ascend_int8 quant matmul.";
-    CHECK(input_offset_is_loaded_ && input_offset_.defined())
-        << "input_offset is required for ascend_int8 quant matmul.";
-    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
-        << "deq_scale is required for ascend_int8 quant matmul.";
-    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
-                          ? std::optional<torch::Tensor>(quant_bias_)
-                          : std::nullopt;
-
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for ascend_int8 quant matmul.";
     if (is_3d) {
       auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
       auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
-
-      auto output_2d = npu_w8a8_linear_forward(input_2d,
-                                               weight_2d,
-                                               input_scale_,
-                                               input_offset_,
-                                               deq_scale_,
-                                               quant_bias,
-                                               output_dtype_);
-
-      output = output_2d.reshape({batch, groups_per_rank, out_features_per_group});
+#if defined(USE_DCU)
+      output = dcu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+      output = npu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
+#endif
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
     } else {
-      output = npu_w8a8_linear_forward(input,
-                                       weight_,
-                                       input_scale_,
-                                       input_offset_,
-                                       deq_scale_,
-                                       quant_bias,
-                                       output_dtype_);
+#if defined(USE_DCU)
+      output = dcu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+      output = npu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
     }
     return output;
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
@@ -2080,10 +2089,6 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
 
-  if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
-    resolved_weight_quant_method_ = "w8a8";
-  }
-
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
@@ -2150,28 +2155,20 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                                 world_size,
                                 weight_,
                                 weight_is_loaded_);
-    weight::load_weight(state_dict,
-                        prefix + "input_scale",
-                        input_scale_,
-                        input_scale_is_loaded_);
-    weight::load_weight(state_dict,
-                        prefix + "input_offset",
-                        input_offset_,
-                        input_offset_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "deq_scale",
+                                prefix + "weight_scale",
                                 0,
                                 rank,
                                 world_size,
-                                deq_scale_,
-                                deq_scale_is_loaded_);
+                                weight_scale_,
+                                weight_scale_is_loaded_);
     weight::load_sharded_weight(state_dict,
-                                prefix + "quant_bias",
+                                prefix + "weight_offset",
                                 0,
                                 rank,
                                 world_size,
-                                quant_bias_,
-                                quant_bias_is_loaded_);
+                                weight_offset_,
+                                weight_offset_is_loaded_);
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     weight::load_sharded_weight(state_dict,
                                 prefix + "weight",
