@@ -242,7 +242,8 @@ bool is_w8a8_dynamic_quant(
 bool is_w8a8_quant(
     const std::optional<std::string>& resolved_weight_quant_method) {
   return resolved_weight_quant_method.has_value() &&
-         resolved_weight_quant_method.value() == "w8a8";
+         (resolved_weight_quant_method.value() == "w8a8" ||
+          resolved_weight_quant_method.value() == "ascend_int8");
 }
 
 bool is_gptq_quant(
