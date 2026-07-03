@@ -2057,6 +2057,15 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
 
+  // If quant_args says ascend_int8 but the checkpoint has no quant markers
+  // (e.g. no deq_scale/weight_scale keys visible to the resolver), force the
+  // resolved method so ensure_w8a8_params_for_linear_load does NOT re-register
+  // the 3D weight as 2D (which would break the reshape_to_3d below).
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8 &&
+      !resolved_weight_quant_method_.has_value()) {
+    resolved_weight_quant_method_ = "ascend_int8";
+  }
+
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
