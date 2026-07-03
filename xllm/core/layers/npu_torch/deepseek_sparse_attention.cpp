@@ -969,8 +969,18 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
     StateDict wo_a_dict(wo_a_dict_map);
     o_a_proj_otp_->load_state_dict(wo_a_dict);
 
-    auto wo_b_dict = state_dict.get_dict_with_prefix("wo_b.");
-    CHECK(wo_b_dict.size() > 0) << "wo_b not found in state_dict";
+    auto wo_b_full = state_dict.get_tensor("wo_b.weight");
+    if (!wo_b_full.defined()) {
+      wo_b_full = state_dict.get_tensor("o_b_proj.weight");
+    }
+    if (!wo_b_full.defined()) {
+      wo_b_full = state_dict.get_tensor("o_proj_b.weight");
+    }
+    CHECK(wo_b_full.defined()) << "wo_b.weight not found in state_dict";
+
+    std::unordered_map<std::string, torch::Tensor> wo_b_dict_map;
+    wo_b_dict_map["weight"] = wo_b_full;
+    StateDict wo_b_dict(wo_b_dict_map);
     o_b_proj_otp_->load_state_dict(wo_b_dict);
   }
 
