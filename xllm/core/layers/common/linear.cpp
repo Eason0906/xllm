@@ -1420,6 +1420,13 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
                   ? std::optional<torch::Tensor>(bias_)
                   : std::nullopt;
   torch::Tensor output;
+
+  LOG(INFO) << "[RowParallelLinear::forward] input dim=" << input.dim()
+            << " sizes=" << input.sizes()
+            << " weight dim=" << weight_.dim()
+            << " sizes=" << weight_.sizes()
+            << " quant_method=" << quant_args_.quant_method();
+
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     CHECK(smooth_.defined()) << "smooth is required for smoothquant.";
     CHECK(qweight_.defined()) << "qweight is required for smoothquant.";
@@ -1847,6 +1854,12 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
   torch::Tensor output;
 
+  LOG(INFO) << "[OTPColumnParallelLinear::forward] input dim=" << input.dim()
+            << " sizes=" << input.sizes()
+            << " weight dim=" << weight_.dim()
+            << " sizes=" << weight_.sizes()
+            << " quant_method=" << quant_args_.quant_method();
+
   bool is_3d = input.dim() == 3 && weight_.dim() == 3;
   int64_t batch = 0;
   int64_t groups_per_rank = 0;
@@ -1861,6 +1874,7 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
   }
 
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] SmoothQuant branch";
     CHECK(qweight_is_loaded_ && qweight_.defined())
         << "qweight is required for smoothquant.";
     CHECK(per_channel_scale_is_loaded_ && per_channel_scale_.defined())
@@ -1914,6 +1928,7 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     }
     return output;
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] FP8 branch";
     CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
         << "weight_scale is required for fp8 quant matmul.";
     auto scale = input_scale_is_loaded_ && input_scale_.defined()
@@ -1931,6 +1946,7 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     }
     return output;
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 branch";
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";
     CHECK(input_offset_is_loaded_ && input_offset_.defined())
@@ -1965,6 +1981,7 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     }
     return output;
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 Dynamic branch";
     auto weight_scale = weight_scale_is_loaded_
                             ? std::optional<torch::Tensor>(weight_scale_)
                             : std::nullopt;
@@ -1992,13 +2009,18 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
     }
     return output;
   } else {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] Fallback branch";
     if (is_3d) {
       auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
       auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
       output = torch::matmul(input_2d, weight_2d.transpose(0, 1));
       output = output.reshape({batch, groups_per_rank, out_features_per_group});
     } else {
-      output = torch::matmul(input, weight_.transpose(1, 2));
+      if (weight_.dim() == 3) {
+        output = torch::matmul(input, weight_.transpose(1, 2));
+      } else {
+        output = torch::matmul(input, weight_.transpose(0, 1));
+      }
     }
     if (bias.has_value()) {
       output = output + bias.value();
