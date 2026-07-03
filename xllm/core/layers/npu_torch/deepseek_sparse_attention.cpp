@@ -914,7 +914,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     // so all_to_all_single tensor sizes match on all ranks.
     int64_t local_num_tokens = num_tokens;
     auto num_tok_t = torch::tensor({local_num_tokens},
-                                    torch::TensorOptions().dtype(torch::kInt64));
+                                    torch::TensorOptions().dtype(torch::kInt64).device(o_group.device()));
     auto all_num_tok = otp_group_->allgather_base_sync(num_tok_t);
     int64_t max_num_tokens = all_num_tok.max().item<int64_t>();
 
