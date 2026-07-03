@@ -904,14 +904,16 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
+  const int64_t groups_per_rank = n_local_groups_ / otp_size_;
+  const int64_t group_hidden_dim = o_group.size(-1);
 
   torch::Tensor output;
-  if (otp_enabled_) {
-    int64_t groups_per_rank = n_local_groups_ / otp_size_;
-    int64_t group_hidden_dim = o_group.size(-1);
-
+  if (otp_enabled_ && !attn_metadata.is_acl_graph) {
     // OTP group spans DP ranks; ensure uniform num_tokens across the group
     // so all_to_all_single tensor sizes match on all ranks.
+    // During ACL graph capture, inputs are already padded to uniform
+    // bucket_num_tokens by the graph executor — skip allgather to avoid
+    // synchronizing on a captured stream.
     int64_t local_num_tokens = num_tokens;
     auto num_tok_t = torch::tensor({local_num_tokens},
                                     torch::TensorOptions().dtype(torch::kInt64).device(o_group.device()));
@@ -919,36 +921,42 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     int64_t max_num_tokens = all_num_tok.max().item<int64_t>();
 
     if (max_num_tokens > local_num_tokens) {
-      // Pad o_group along token dim to max_num_tokens
       int64_t pad_len = max_num_tokens - local_num_tokens;
       auto pad = torch::zeros({pad_len, n_local_groups_, group_hidden_dim},
                                o_group.options());
       o_group = torch::cat({o_group, pad}, 0);
     }
+    const int64_t padded_num_tokens = max_num_tokens;
 
-    // Now all ranks have the same num_tokens = max_num_tokens
-    int64_t padded_num_tokens = max_num_tokens;
     auto o_reshaped = o_group.view({padded_num_tokens, otp_size_, groups_per_rank, group_hidden_dim});
     auto send_buf = o_reshaped.permute({1, 0, 2, 3}).contiguous().view({-1});
-
     auto recv_buf = torch::empty(
         {otp_size_ * padded_num_tokens * groups_per_rank * group_hidden_dim},
         o_group.options());
     otp_group_->all_to_all_single(recv_buf, send_buf);
-
     auto o_shuffled = recv_buf.view({otp_size_ * padded_num_tokens, groups_per_rank, group_hidden_dim});
     auto o_low_rank = o_a_proj_otp_->forward(o_shuffled);
-
     auto o_low_rank_flat = o_low_rank.reshape({otp_size_ * padded_num_tokens, groups_per_rank * o_lora_rank_});
     auto o_b_output = o_b_proj_otp_->forward(o_low_rank_flat);
-
     output = torch::empty({padded_num_tokens, o_b_output.size(-1)}, o_b_output.options());
     otp_group_->reduce_scatter(o_b_output, output);
-
-    // Trim padding if we padded at the start
     if (padded_num_tokens > local_num_tokens) {
       output = output.slice(0, 0, local_num_tokens);
     }
+  } else if (otp_enabled_) {
+    // ACL graph mode: num_tokens is already uniform (padded by graph executor).
+    auto o_reshaped = o_group.view({num_tokens, otp_size_, groups_per_rank, group_hidden_dim});
+    auto send_buf = o_reshaped.permute({1, 0, 2, 3}).contiguous().view({-1});
+    auto recv_buf = torch::empty(
+        {otp_size_ * num_tokens * groups_per_rank * group_hidden_dim},
+        o_group.options());
+    otp_group_->all_to_all_single(recv_buf, send_buf);
+    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank, group_hidden_dim});
+    auto o_low_rank = o_a_proj_otp_->forward(o_shuffled);
+    auto o_low_rank_flat = o_low_rank.reshape({otp_size_ * num_tokens, groups_per_rank * o_lora_rank_});
+    auto o_b_output = o_b_proj_otp_->forward(o_low_rank_flat);
+    output = torch::empty({num_tokens, o_b_output.size(-1)}, o_b_output.options());
+    otp_group_->reduce_scatter(o_b_output, output);
   } else {
     auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
     auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
