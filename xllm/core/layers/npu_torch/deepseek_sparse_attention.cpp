@@ -916,12 +916,10 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         o_group.options());
     otp_group_->all_to_all_single(recv_buf, send_buf);
 
-    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank, group_hidden_dim});
-    auto wo_a = o_a_proj_otp_->weight().view({groups_per_rank, o_lora_rank_, group_hidden_dim});
-    auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_shuffled, wo_a});
+    auto o_shuffled = recv_buf.view({otp_size_ * num_tokens, groups_per_rank * group_hidden_dim});
+    auto o_low_rank = o_a_proj_otp_->forward(o_shuffled);
 
-    auto o_flat = o_low_rank.reshape({otp_size_ * num_tokens, -1});
-    auto o_b_output = o_b_proj_otp_->forward(o_flat);
+    auto o_b_output = o_b_proj_otp_->forward(o_low_rank);
 
     output = torch::empty({num_tokens, o_b_output.size(-1)}, o_b_output.options());
     otp_group_->reduce_scatter(o_b_output, output);
