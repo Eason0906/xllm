@@ -2090,10 +2090,15 @@ void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   // OTPColumnParallelLinear stores weights as 3D [groups_per_rank,
   // out_features_per_group, in_features], but checkpoints store them as
   // standard 2D [out_features, in_features]. Reshape after loading.
-  // Must happen before ensure_w8a8_params_for_linear_load so the lazy param
-  // registration sees the correct out_features (= prod of first two dims).
+  // NOTE: compute target shape from groups_per_rank_ and the tensor itself,
+  // NOT from weight_.sizes(), because ensure_w8a8_params_for_linear_load may
+  // have re-registered weight_ as 2D (lazy quant fallback path).
   auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
-    return t.reshape(weight_.sizes());
+    if (t.dim() != 2) return t;
+    const int64_t in_features = t.size(-1);
+    const int64_t groups_times_out = t.numel() / in_features;
+    const int64_t out_per_group = groups_times_out / groups_per_rank_;
+    return t.reshape({groups_per_rank_, out_per_group, in_features});
   };
 
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
