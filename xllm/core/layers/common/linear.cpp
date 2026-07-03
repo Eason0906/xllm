@@ -2043,11 +2043,14 @@ torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
   } else {
     LOG(INFO) << "[OTPColumnParallelLinear::forward] Fallback branch";
     if (is_3d) {
-      // Per-group matmul: each group's weight [out_per_group, in] applied to
-      // its corresponding input slice.  Equivalent to einsum("tgd,grd->tgr").
-      output = torch::matmul(input.unsqueeze(3),
-                             weight_.unsqueeze(1).transpose(2, 3))
-                   .squeeze(3);
+      // Per-group batched matmul: move groups to the batch dim so that both
+      // input and weight share the same leading dimension G.
+      //   input:    [B, G, I] → permute(1,0,2) → [G, B, I]
+      //   weight_:  [G, O, I] → transpose(1,2) → [G, I, O]
+      //   matmul([G, B, I], [G, I, O]) → [G, B, O] → permute(1,0,2) → [B, G, O]
+      output =
+          torch::matmul(input.permute({1, 0, 2}), weight_.transpose(1, 2))
+              .permute({1, 0, 2});
     } else {
       if (weight_.dim() == 3) {
         output = torch::matmul(input, weight_.transpose(1, 2));
