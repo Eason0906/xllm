@@ -391,17 +391,35 @@ void CollectiveCommunicator::create_process_groups(
   port += dp_size + single_rank_group_port_gap + single_rank_group_count;
 
   if (dp_size > 1) {
-    port_offset = global_rank % tp_size + 1;
-    dp_local_process_group_ = create_process_group(global_rank,
-                                                   world_size,
-                                                   dp_size,
-                                                   port + port_offset,
-                                                   true,
-                                                   host,
-                                                   "dp_group",
-                                                   device);
-    parallel_args_->dp_local_process_group_ = dp_local_process_group_.get();
-    port += tp_size;
+    if (tp_size == 1) {
+      // When tp_size == 1, dp_size == world_size. In this case, the trans=true
+      // dp_group has trans_group_size=1, meaning each rank gets a unique
+      // local_rank. Since only local_rank==0 creates the TCPStore server, all
+      // ranks must share the same port to avoid connection timeouts.
+      port_offset = 1;
+      dp_local_process_group_ = create_process_group(global_rank,
+                                                     world_size,
+                                                     dp_size,
+                                                     port + port_offset,
+                                                     true,
+                                                     host,
+                                                     "dp_group",
+                                                     device);
+      parallel_args_->dp_local_process_group_ = dp_local_process_group_.get();
+      port += dp_size;
+    } else {
+      port_offset = global_rank % tp_size + 1;
+      dp_local_process_group_ = create_process_group(global_rank,
+                                                     world_size,
+                                                     dp_size,
+                                                     port + port_offset,
+                                                     true,
+                                                     host,
+                                                     "dp_group",
+                                                     device);
+      parallel_args_->dp_local_process_group_ = dp_local_process_group_.get();
+      port += tp_size;
+    }
   }
 
   int32_t moe_tp_size = world_size / ep_size;
@@ -428,7 +446,21 @@ void CollectiveCommunicator::create_process_groups(
                                          device);
     parallel_args_->moe_tp_group_ = moe_tp_group_.get();
     port += ep_size;
-    port_offset = global_rank % moe_tp_size + 1;
+    // When moe_tp_size == 1, we have ep_size == world_size and trans_group_size=1.
+    // In this case, all ranks belong to the same transposed group but get different
+    // local_rank values. However, TCPStore requires all ranks to use the same port
+    // to connect to the same store. Using a fixed port_offset=1 ensures all ranks
+    // in this scenario share the same port, regardless of world_size.
+    // This is correct because:
+    // 1. 'port' is cumulative across process groups (not global rank-specific)
+    // 2. port_offset=1 means all ranks use (base_port + 1), ensuring they connect
+    //    to the same TCPStore instance
+    // 3. This works for any world_size since it's a relative offset, not absolute
+    if (moe_tp_size == 1) {
+      port_offset = 1;
+    } else {
+      port_offset = global_rank % moe_tp_size + 1;
+    }
     moe_ep_group_ = create_process_group(global_rank,
                                          world_size,
                                          ep_size,
@@ -438,6 +470,27 @@ void CollectiveCommunicator::create_process_groups(
                                          "moe_ep_group",
                                          device);
     parallel_args_->moe_ep_group_ = moe_ep_group_.get();
+    port += ep_size;
+  }
+
+  int32_t otp_size = ::xllm::ParallelConfig::get_instance().otp_size();
+  parallel_args_->otp_size(otp_size);
+  if (otp_size > 1) {
+    CHECK_EQ(tp_size, 1)
+        << "OTP requires tensor_parallel_size == 1, got " << tp_size;
+    CHECK_EQ(dp_size % otp_size, 0)
+        << "dp_size (" << dp_size << ") must be divisible by otp_size (" << otp_size << ")";
+    port_offset = global_rank / otp_size + 1;
+    otp_group_ = create_process_group(global_rank,
+                                      world_size,
+                                      otp_size,
+                                      port + port_offset,
+                                      false,
+                                      host,
+                                      "otp_group",
+                                      device);
+    parallel_args_->otp_group_ = otp_group_.get();
+    port += dp_size / otp_size;
   }
 
 #if defined(USE_NPU)

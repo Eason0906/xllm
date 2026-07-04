@@ -242,7 +242,14 @@ bool is_w8a8_dynamic_quant(
 bool is_w8a8_quant(
     const std::optional<std::string>& resolved_weight_quant_method) {
   return resolved_weight_quant_method.has_value() &&
-         resolved_weight_quant_method.value() == "w8a8";
+         (resolved_weight_quant_method.value() == "w8a8" ||
+          resolved_weight_quant_method.value() == "ascend_int8");
+}
+
+bool is_gptq_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  return resolved_weight_quant_method.has_value() &&
+         resolved_weight_quant_method.value() == "gptq";
 }
 
 torch::Dtype get_w8a8_deq_scale_dtype(const torch::TensorOptions& options) {
@@ -316,8 +323,15 @@ void ensure_w8a8_params_for_linear_load(
 
   CHECK(refs.weight.defined())
       << "weight must be registered before lazy quant init";
-  const int64_t out_features = refs.weight.size(0);
-  const int64_t in_features = refs.weight.size(1);
+  int64_t out_features;
+  int64_t in_features;
+  if (refs.weight.dim() == 3) {
+    out_features = refs.weight.size(0) * refs.weight.size(1);
+    in_features = refs.weight.size(2);
+  } else {
+    out_features = refs.weight.size(0);
+    in_features = refs.weight.size(1);
+  }
 
   specs.reserve(4);
   if (is_w8a8_quant(resolved_weight_quant_method)) {
@@ -1407,6 +1421,13 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
                   ? std::optional<torch::Tensor>(bias_)
                   : std::nullopt;
   torch::Tensor output;
+
+  LOG(INFO) << "[RowParallelLinear::forward] input dim=" << input.dim()
+            << " sizes=" << input.sizes()
+            << " weight dim=" << weight_.dim()
+            << " sizes=" << weight_.sizes()
+            << " quant_method=" << quant_args_.quant_method();
+
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
     CHECK(smooth_.defined()) << "smooth is required for smoothquant.";
     CHECK(qweight_.defined()) << "qweight is required for smoothquant.";
@@ -1735,6 +1756,533 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
   if (bias_.defined()) {
     LOAD_WEIGHT(bias);
   }
+}
+
+OTPColumnParallelLinearImpl::OTPColumnParallelLinearImpl(
+    int64_t in_features,
+    int64_t out_features,
+    int64_t num_groups,
+    bool bias,
+    const QuantArgs& quant_args,
+    ProcessGroup* process_group,
+    const torch::TensorOptions& options)
+    : device_(options.device()),
+      process_group_(process_group),
+      quant_args_(quant_args),
+      options_(options),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+  rank_ = process_group_->rank();
+  world_size_ = process_group_->world_size();
+  num_groups_ = num_groups;
+  CHECK(num_groups % world_size_ == 0)
+      << "num_groups " << num_groups << " not divisible by world_size "
+      << world_size_;
+  groups_per_rank_ = num_groups / world_size_;
+
+  const int64_t out_features_per_group = out_features / num_groups;
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    qweight_ = register_parameter(
+        "qweight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+    per_channel_scale_ = register_parameter(
+        "per_channel_scale",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+    smooth_ = register_parameter(
+        "smooth",
+        torch::empty({in_features}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kFloat8_e4m3fn)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_},
+                     options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+    if (!quant_args_.activation_dynamic()) {
+      input_scale_ = register_parameter(
+          "input_scale",
+          torch::empty({1}, options.dtype(torch::kFloat32)),
+          /*requires_grad=*/false);
+    }
+  } else if (quant_args_.quant_method() == kQuantMethodAscendInt8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_ * out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
+        /*requires_grad=*/false);
+    weight_offset_ = register_parameter(
+        "weight_offset",
+        torch::empty({groups_per_rank_ * out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
+        /*requires_grad=*/false);
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+  } else {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({groups_per_rank_, out_features_per_group, in_features},
+                     options),
+        /*requires_grad=*/false);
+  }
+
+  if (bias) {
+    bias_ = register_parameter(
+        "bias",
+        torch::empty({groups_per_rank_, out_features_per_group}, options),
+        /*requires_grad=*/false);
+  }
+
+  if (quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({groups_per_rank_, out_features_per_group},
+                     torch::TensorOptions().dtype(torch::kFloat32).device(device_)),
+        /*requires_grad=*/false);
+    if (quant_args_.quant_descs().empty()) {
+      weight_offset_ = register_parameter(
+          "weight_offset",
+          torch::empty({groups_per_rank_, out_features_per_group},
+                       torch::TensorOptions().dtype(torch::kInt8).device(device_)),
+          /*requires_grad=*/false);
+    }
+  }
+}
+
+torch::Tensor OTPColumnParallelLinearImpl::forward(torch::Tensor input) {
+  auto bias =
+      bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  torch::Tensor output;
+
+  LOG(INFO) << "[OTPColumnParallelLinear::forward] input dim=" << input.dim()
+            << " sizes=" << input.sizes()
+            << " weight dim=" << weight_.dim()
+            << " sizes=" << weight_.sizes()
+            << " quant_method=" << quant_args_.quant_method();
+
+  // Forward may see resolved_weight_quant_method_ as nullopt if the value was
+  // reset between load_state_dict and forward (e.g. during model re-creation
+  // for graph capture). Re-apply the same fallback as load_state_dict.
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8 &&
+      !resolved_weight_quant_method_.has_value()) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved is nullopt, forcing to ascend_int8";
+    resolved_weight_quant_method_ = "ascend_int8";
+  } else if (resolved_weight_quant_method_.has_value()) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved="
+              << resolved_weight_quant_method_.value();
+  } else {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] resolved=nullopt, quant_method="
+              << quant_args_.quant_method();
+  }
+
+  bool is_3d = input.dim() == 3 && weight_.dim() == 3;
+  int64_t batch = 0;
+  int64_t groups_per_rank = 0;
+  int64_t group_hidden_dim = 0;
+  int64_t out_features_per_group = 0;
+
+  if (is_3d) {
+    batch = input.size(0);
+    groups_per_rank = input.size(1);
+    group_hidden_dim = input.size(2);
+    out_features_per_group = weight_.size(1);
+  }
+
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] SmoothQuant branch";
+    CHECK(qweight_is_loaded_ && qweight_.defined())
+        << "qweight is required for smoothquant.";
+    CHECK(per_channel_scale_is_loaded_ && per_channel_scale_.defined())
+        << "per_channel_scale is required for smoothquant.";
+
+    torch::Tensor quantized_input;
+    torch::Tensor input_scale;
+
+    xllm::kernel::ScaledQuantizeParams quantize_params;
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      quantize_params.x = input_2d;
+    } else {
+      quantize_params.x = input;
+    }
+    quantize_params.smooth = smooth_;
+    quantize_params.zero = std::nullopt;
+    quantize_params.token_count = std::nullopt;
+    quantize_params.gather_index = std::nullopt;
+    quantize_params.gather_index_start_position = std::nullopt;
+    quantize_params.output = std::nullopt;
+    quantize_params.output_scale = std::nullopt;
+    quantize_params.act_mode = "none";
+    quantize_params.active_coef = 1.0;
+    quantize_params.is_gated = false;
+
+    std::tie(quantized_input, input_scale) =
+        xllm::kernel::scaled_quantize(quantize_params);
+
+    xllm::kernel::ScaledMatmulParams matmul_params;
+    matmul_params.a = quantized_input;
+    matmul_params.b = qweight_;
+    matmul_params.a_scale = input_scale;
+    matmul_params.b_scale = per_channel_scale_;
+    matmul_params.output_dtype = output_dtype_;
+    matmul_params.bias = bias;
+    matmul_params.c = std::nullopt;
+    matmul_params.act_mode = "none";
+    matmul_params.quant_bit_size = 8;
+    matmul_params.alpha = 1.0;
+    matmul_params.beta = 0.0;
+    matmul_params.use_hp_active = false;
+    matmul_params.a_quant_bit_size = 8;
+    matmul_params.a_calib = std::nullopt;
+    matmul_params.b_calib = std::nullopt;
+    matmul_params.output = std::nullopt;
+
+    output = xllm::kernel::scaled_matmul(matmul_params);
+    if (is_3d) {
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    }
+    return output;
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] FP8 branch";
+    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+        << "weight_scale is required for fp8 quant matmul.";
+    auto scale = input_scale_is_loaded_ && input_scale_.defined()
+                     ? std::optional<torch::Tensor>(input_scale_)
+                     : std::nullopt;
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+      output = fp8_linear_forward(
+          input_2d, weight_2d, weight_scale_, scale, bias, output_dtype_);
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = fp8_linear_forward(
+          input, weight_, weight_scale_, scale, bias, output_dtype_);
+    }
+    return output;
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 branch";
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+
+      auto output_2d = npu_w8a8_linear_forward(input_2d,
+                                               weight_2d,
+                                               input_scale_,
+                                               input_offset_,
+                                               deq_scale_,
+                                               quant_bias,
+                                               output_dtype_);
+
+      output = output_2d.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+      output = npu_w8a8_linear_forward(input,
+                                       weight_,
+                                       input_scale_,
+                                       input_offset_,
+                                       deq_scale_,
+                                       quant_bias,
+                                       output_dtype_);
+    }
+    return output;
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] W8A8 Dynamic branch";
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+    if (is_3d) {
+      auto input_2d = input.reshape({batch * groups_per_rank, group_hidden_dim});
+      auto weight_2d = weight_.reshape({groups_per_rank * out_features_per_group, group_hidden_dim});
+#if defined(USE_DCU)
+      output = dcu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+      output = npu_w8a8_dynamic_linear_forward(
+          input_2d, weight_2d, weight_scale.value(), bias, output_dtype_);
+#endif
+      output = output.reshape({batch, groups_per_rank, out_features_per_group});
+    } else {
+#if defined(USE_DCU)
+      output = dcu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#elif defined(USE_NPU)
+      output = npu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
+    }
+    return output;
+  } else {
+    LOG(INFO) << "[OTPColumnParallelLinear::forward] Fallback branch";
+    if (is_3d) {
+      // Per-group batched matmul: move groups to the batch dim so that both
+      // input and weight share the same leading dimension G.
+      //   input:    [B, G, I] → permute(1,0,2) → [G, B, I]
+      //   weight_:  [G, O, I] → transpose(1,2) → [G, I, O]
+      //   matmul([G, B, I], [G, I, O]) → [G, B, O] → permute(1,0,2) → [B, G, O]
+      output =
+          torch::matmul(input.permute({1, 0, 2}), weight_.transpose(1, 2))
+              .permute({1, 0, 2});
+    } else {
+      if (weight_.dim() == 3) {
+        output = torch::matmul(input, weight_.transpose(1, 2));
+      } else {
+        output = torch::matmul(input, weight_.transpose(0, 1));
+      }
+    }
+    if (bias.has_value()) {
+      output = output + bias.value();
+    }
+    return output;
+  }
+}
+
+void OTPColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
+
+  const int64_t rank = world_size_ == 1 ? 0 : rank_;
+  const int64_t world_size = world_size_;
+
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  // If quant_args says ascend_int8 but the checkpoint has no quant markers
+  // (e.g. no deq_scale/weight_scale keys visible to the resolver), force the
+  // resolved method so ensure_w8a8_params_for_linear_load does NOT re-register
+  // the 3D weight as 2D (which would break the reshape_to_3d below).
+  if (quant_args_.quant_method() == kQuantMethodAscendInt8 &&
+      !resolved_weight_quant_method_.has_value()) {
+    resolved_weight_quant_method_ = "ascend_int8";
+  }
+
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_});
+
+  // OTPColumnParallelLinear stores weights as 3D [groups_per_rank,
+  // out_features_per_group, in_features], but checkpoints store them as
+  // standard 2D [out_features, in_features]. Reshape after loading.
+  // NOTE: compute target shape from groups_per_rank_ and the tensor itself,
+  // NOT from weight_.sizes(), because ensure_w8a8_params_for_linear_load may
+  // have re-registered weight_ as 2D (lazy quant fallback path).
+  // Also manually load+reshape instead of using reshape_to_3d transform via
+  // load_sharded_weight, because load_sharded_weight checks that the loaded
+  // tensor shape matches weight_.sizes() AFTER the transform — if weight_ was
+  // re-registered as 2D, the check fails even though the reshape is correct.
+  auto load_otp_weight = [this](const StateDict& sd, const std::string& key,
+                                int32_t rank, int32_t wsize) {
+    auto t = sd.get_sharded_tensor(key, 0, rank, wsize);
+    if (!t.defined()) return;
+    CHECK(!weight_is_loaded_)
+        << "weight already loaded for " << sd.prefix() << key;
+    auto reshaped = t.dim() == 2
+                        ? t.reshape({groups_per_rank_,
+                                     t.numel() / (groups_per_rank_ * t.size(-1)),
+                                     t.size(-1)})
+                        : t;
+    weight_.set_data(reshaped.to(weight_.dtype()).to(device_));
+    weight_is_loaded_ = true;
+  };
+
+  // Also needed for SmoothQuant/FP8/GPTQ branches (unused for ascend_int8).
+  auto reshape_to_3d = [this](const torch::Tensor& t) -> torch::Tensor {
+    if (t.dim() != 2) return t;
+    const int64_t in_features = t.size(-1);
+    const int64_t groups_times_out = t.numel() / in_features;
+    const int64_t out_per_group = groups_times_out / groups_per_rank_;
+    return t.reshape({groups_per_rank_, out_per_group, in_features});
+  };
+
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    weight::load_sharded_weight(state_dict,
+                                "qweight",
+                                reshape_to_3d,
+                                0,
+                                rank,
+                                world_size,
+                                qweight_,
+                                qweight_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                "per_channel_scale",
+                                0,
+                                rank,
+                                world_size,
+                                per_channel_scale_,
+                                per_channel_scale_is_loaded_);
+    weight::load_weight(state_dict,
+                        "smooth",
+                        smooth_,
+                        smooth_is_loaded_);
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    weight::load_sharded_weight(state_dict,
+                                "weight",
+                                reshape_to_3d,
+                                0,
+                                rank,
+                                world_size,
+                                weight_,
+                                weight_is_loaded_);
+    weight::load_weight(state_dict,
+                        "weight_scale",
+                        weight_scale_,
+                        weight_scale_is_loaded_);
+    if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
+      weight::load_weight(state_dict,
+                          "input_scale",
+                          input_scale_,
+                          input_scale_is_loaded_);
+    }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    // Handles both "w8a8" and "ascend_int8" (static w8a8).
+    load_otp_weight(state_dict, "weight", rank, world_size);
+    weight::load_weight(state_dict,
+                        "input_scale",
+                        input_scale_,
+                        input_scale_is_loaded_);
+    weight::load_weight(state_dict,
+                        "input_offset",
+                        input_offset_,
+                        input_offset_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                "deq_scale",
+                                0,
+                                rank,
+                                world_size,
+                                deq_scale_,
+                                deq_scale_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                "quant_bias",
+                                0,
+                                rank,
+                                world_size,
+                                quant_bias_,
+                                quant_bias_is_loaded_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    load_otp_weight(state_dict, "weight", rank, world_size);
+    weight::load_sharded_weight(state_dict,
+                                "weight_scale",
+                                0,
+                                rank,
+                                world_size,
+                                weight_scale_,
+                                weight_scale_is_loaded_);
+    if (weight_offset_.defined()) {
+      weight::load_sharded_weight(state_dict,
+                                  "weight_offset",
+                                  0,
+                                  rank,
+                                  world_size,
+                                  weight_offset_,
+                                  weight_offset_is_loaded_);
+    }
+  } else if (is_gptq_quant(resolved_weight_quant_method_)) {
+    weight::load_sharded_weight(state_dict,
+                                "qweight",
+                                reshape_to_3d,
+                                0,
+                                rank,
+                                world_size,
+                                qweight_,
+                                qweight_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                "qzeros",
+                                0,
+                                rank,
+                                world_size,
+                                qzeros_,
+                                qzeros_is_loaded_);
+    weight::load_sharded_weight(state_dict,
+                                "scales",
+                                0,
+                                rank,
+                                world_size,
+                                scales_,
+                                scales_is_loaded_);
+    if (qbias_.defined()) {
+      weight::load_sharded_weight(state_dict,
+                                  "qbias",
+                                  0,
+                                  rank,
+                                  world_size,
+                                  qbias_,
+                                  qbias_is_loaded_);
+    }
+  } else {
+    load_otp_weight(state_dict, "weight", rank, world_size);
+  }
+
+  if (bias_.defined()) {
+    weight::load_sharded_weight(state_dict,
+                                "bias",
+                                0,
+                                rank,
+                                world_size,
+                                bias_,
+                                bias_is_loaded_);
+  }
+}
+
+bool OTPColumnParallelLinearImpl::uses_w8a8_dynamic_quant() const {
+  return is_w8a8_dynamic_quant(resolved_weight_quant_method_);
+}
+
+torch::Tensor OTPColumnParallelLinearImpl::w8a8_dynamic_weight_scale() const {
+  return weight_scale_;
+}
+
+at::ScalarType OTPColumnParallelLinearImpl::output_dtype() const {
+  return output_dtype_;
+}
+
+std::optional<torch::Tensor> OTPColumnParallelLinearImpl::bias() const {
+  return bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
 }
 
 }  // namespace layer

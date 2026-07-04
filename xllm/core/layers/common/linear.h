@@ -374,5 +374,69 @@ class ReplicatedLinearImpl : public torch::nn::Module {
 };
 TORCH_MODULE(ReplicatedLinear);
 
+class OTPColumnParallelLinearImpl : public torch::nn::Module {
+ public:
+  OTPColumnParallelLinearImpl(
+      int64_t in_features,
+      int64_t out_features,
+      int64_t num_groups,
+      bool bias,
+      const QuantArgs& quant_args,
+      ProcessGroup* process_group,
+      const torch::TensorOptions& options);
+
+  torch::Tensor forward(torch::Tensor input);
+
+  void load_state_dict(const StateDict& state_dict);
+
+  void pretty_print(std::ostream& stream) const {
+    stream << name() << " " << weight_.sizes() << " " << weight_.device();
+  }
+
+  torch::Tensor weight() const {
+    if (qweight_is_loaded_) {
+      return qweight_;
+    }
+    return weight_;
+  }
+
+  bool uses_w8a8_dynamic_quant() const;
+  torch::Tensor w8a8_dynamic_weight_scale() const;
+  at::ScalarType output_dtype() const;
+  std::optional<torch::Tensor> bias() const;
+
+ private:
+  int64_t rank_;
+  int64_t world_size_;
+  int64_t num_groups_;
+  int64_t groups_per_rank_;
+  torch::Device device_;
+  ProcessGroup* process_group_;
+
+  DEFINE_WEIGHT(weight);
+  DEFINE_WEIGHT(bias);
+
+  DEFINE_WEIGHT(qweight);
+  DEFINE_WEIGHT(qzeros);
+  DEFINE_WEIGHT(scales);
+  DEFINE_WEIGHT(qbias);
+
+  DEFINE_WEIGHT(per_channel_scale);
+  DEFINE_WEIGHT(smooth);
+
+  DEFINE_WEIGHT(input_scale);
+  DEFINE_WEIGHT(input_offset);
+  DEFINE_WEIGHT(deq_scale);
+  DEFINE_WEIGHT(quant_bias);
+  DEFINE_WEIGHT(weight_scale);
+  DEFINE_WEIGHT(weight_offset);
+
+  QuantArgs quant_args_;
+  torch::TensorOptions options_;
+  at::ScalarType output_dtype_;
+  std::optional<std::string> resolved_weight_quant_method_;
+};
+TORCH_MODULE(OTPColumnParallelLinear);
+
 }  // namespace layer
 }  // namespace xllm

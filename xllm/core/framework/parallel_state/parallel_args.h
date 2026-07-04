@@ -188,6 +188,16 @@ struct ParallelArgs {
   // cfg size
   PROPERTY(int32_t, vae_size) = 1;
 
+  // OTP (o_proj tensor parallel) size
+  PROPERTY(int32_t, otp_size) = 1;
+
+  // Derived: OTP rank within the OTP group
+  [[nodiscard]] int32_t otp_rank() const noexcept {
+    if (otp_size_ <= 1) return 0;
+    int32_t tp_sz = world_size_ / dp_size_ / cp_size_;
+    return (rank_ % (otp_size_ * tp_sz)) / tp_sz;
+  }
+
   // atb hccl mapping json data
   PROPERTY(nlohmann::json, mapping_data);
 
@@ -223,6 +233,8 @@ struct ParallelArgs {
   ProcessGroup* dit_cfg_group_ = nullptr;
   ProcessGroup* dit_dp_group_ = nullptr;
   ProcessGroup* dit_vae_group_ = nullptr;
+
+  ProcessGroup* otp_group_ = nullptr;
 };
 
 }  // namespace xllm
