@@ -690,6 +690,25 @@ void DisaggPDScheduler::prefill_send_first_generation() {
           block_ids.push_back(block.id());
         }
         ADD_VECTOR_TO_PROTO(gen->mutable_block_ids(), block_ids);
+
+        // For DSV4 pool-based cache, also send multi-block IDs (SWA, C4, C128).
+        static const std::array<BlockType, 3> kDsv4BlockTypes = {
+            BlockType::SWA, BlockType::C4, BlockType::C128};
+        static const std::array<const char*, 3> kDsv4BlockTypeNames = {
+            "SWA", "C4", "C128"};
+        for (size_t i = 0; i < kDsv4BlockTypes.size(); ++i) {
+          const auto pool_blocks =
+              request->sequences()[0]->kv_state().blocks(kDsv4BlockTypes[i]);
+          if (pool_blocks.empty()) {
+            continue;
+          }
+          auto* multi_ids = gen->add_multi_block_ids();
+          multi_ids->set_block_type(kDsv4BlockTypeNames[i]);
+          for (const auto& block : pool_blocks) {
+            multi_ids->add_block_ids(block.id());
+          }
+        }
+
         gen->set_linear_state_id(
             request->sequences()[0]->get_single_block_id());
         gen->set_dp_size(instance_info_.dp_size);
@@ -793,7 +812,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     int32_t src_linear_state_id,
     int32_t src_dp_size,
     int32_t src_dp_rank,
-    torch::Tensor mtp_bootstrap_embedding) {
+    torch::Tensor mtp_bootstrap_embedding,
+    std::vector<std::vector<uint64_t>> src_multi_block_ids) {
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
   {
@@ -909,6 +929,47 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       LOG(ERROR) << "Failed to pull KV blocks, request_id: " << req_id;
       kv_cache_manager_->deallocate(request.get());
       return false;
+    }
+
+    // Pull DSV4 multi-block (SWA, C4, C128) KV cache if present.
+    // BlockType order in src_multi_block_ids must match the export order:
+    // SWA, C4, C128 (see kMultiBlockExportOrder in block.h).
+    static const std::array<BlockType, 3> kDsv4BlockTypes = {
+        BlockType::SWA, BlockType::C4, BlockType::C128};
+    for (size_t i = 0; i < src_multi_block_ids.size() &&
+                        i < kDsv4BlockTypes.size(); ++i) {
+      const auto& src_multi_ids = src_multi_block_ids[i];
+      if (src_multi_ids.empty()) {
+        continue;
+      }
+      // Get decode-side block IDs for this block type.
+      const auto dst_multi_blocks =
+          sequence->kv_state().blocks(kDsv4BlockTypes[i]);
+      std::vector<uint64_t> dst_multi_ids;
+      dst_multi_ids.reserve(dst_multi_blocks.size());
+      for (const auto& block : dst_multi_blocks) {
+        dst_multi_ids.push_back(block.id());
+      }
+      if (dst_multi_ids.size() != src_multi_ids.size()) {
+        LOG(ERROR) << "Mismatched DSV4 block count for type "
+                   << static_cast<int>(kDsv4BlockTypes[i])
+                   << ", src=" << src_multi_ids.size()
+                   << ", dst=" << dst_multi_ids.size()
+                   << ", request_id: " << req_id;
+        kv_cache_manager_->deallocate(request.get());
+        return false;
+      }
+      const bool multi_pulled = engine_->pull_kv_blocks(
+          src_dp_size, src_dp_rank, src_cluster_ids, src_addrs,
+          src_multi_ids, dst_dp_rank, dst_multi_ids,
+          src_linear_state_ids, dst_linear_state_ids);
+      if (!multi_pulled) {
+        LOG(ERROR) << "Failed to pull DSV4 KV blocks type "
+                   << static_cast<int>(kDsv4BlockTypes[i])
+                   << ", request_id: " << req_id;
+        kv_cache_manager_->deallocate(request.get());
+        return false;
+      }
     }
   }
 

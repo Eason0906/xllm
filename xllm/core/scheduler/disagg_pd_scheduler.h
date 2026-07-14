@@ -74,7 +74,9 @@ class DisaggPDScheduler : public ChunkedPrefillScheduler {
       int32_t src_linear_state_id,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      torch::Tensor mtp_bootstrap_embedding = torch::Tensor());
+      torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
+      // DSV4 multi-block (SWA/C4/C128) IDs from prefill
+      std::vector<std::vector<uint64_t>> src_multi_block_ids = {});
 
   // decode allocate blocks with prefix cache.
   bool try_allocate(Sequence* sequence);

@@ -245,6 +245,10 @@ message DisaggGenerationsRequest {
   int32 linear_state_id = 13;
   // MTP bootstrap state for the first decode draft extend.
   Tensor mtp_bootstrap_embedding = 14;
+  // Multi-block IDs for DSV4 pool-based cache (SWA, C4, C128).
+  // Each entry stores one block type's block IDs.
+  // Standard models leave this empty and use block_ids instead.
+  repeated MultiBlockIds multi_block_ids = 15;
 }
 
 message DisaggGenerationsRequests {
@@ -259,6 +263,14 @@ message InstanceClusterInfo {
   int32 dp_size = 6;
   // Prefill-side effective KV-split width for link_cluster on decode.
   int32 kv_split_size = 7;
+}
+
+// Block IDs for DSV4-specific block types (SWA / C4 / C128).
+message MultiBlockIds {
+  // Block type string: "SWA", "C4", or "C128"
+  optional string block_type = 1;
+  // Block IDs for this type
+  repeated uint64 block_ids = 2;
 }
 
 service DisaggPDService {

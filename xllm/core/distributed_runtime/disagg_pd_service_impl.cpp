@@ -241,6 +241,14 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
     std::vector<std::string> addrs(gen.addrs().begin(), gen.addrs().end());
     std::vector<uint64_t> block_ids(gen.block_ids().begin(),
                                     gen.block_ids().end());
+    // Extract DSV4 multi-block IDs (SWA, C4, C128).
+    std::vector<std::vector<uint64_t>> src_multi_block_ids;
+    for (int m = 0; m < gen.multi_block_ids_size(); ++m) {
+      const auto& multi = gen.multi_block_ids(m);
+      std::vector<uint64_t> ids(multi.block_ids().begin(),
+                                multi.block_ids().end());
+      src_multi_block_ids.push_back(std::move(ids));
+    }
     int32_t linear_state_id = gen.linear_state_id();
     torch::Tensor mtp_bootstrap_embedding;
     if (gen.has_mtp_bootstrap_embedding()) {
@@ -263,7 +271,8 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         linear_state_id,
         gen.dp_size(),
         gen.dp_rank(),
-        mtp_bootstrap_embedding);
+        mtp_bootstrap_embedding,
+        std::move(src_multi_block_ids));
     if (!success) {
       response->set_ok(false);
       return;
