@@ -897,6 +897,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
     if (xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
+      VLOG(1) << "Using fused moe_grouped_matmul_swiglu_quant";
       xllm::kernel::MoeGroupedMatmulSwigluQuantParams fused_params;
       fused_params.x = quantized_expand_hidden_states;
       fused_params.weight = w13_;
@@ -906,6 +907,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       std::tie(act_quantized, act_scale) =
           xllm::kernel::moe_grouped_matmul_swiglu_quant(fused_params);
     } else {
+      VLOG(1) << "Fused op not available, fallback to separate "
+              << "group_gemm + dequant_swiglu_quant";
       std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
       std::vector<torch::Tensor> weight_list = {w13_};
       xllm::kernel::GroupGemmParams group_gemm_params;
