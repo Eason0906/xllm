@@ -903,7 +903,9 @@ torch::Tensor FusedMoEImpl::forward_expert(
       fused_params.weight = w13_;
       fused_params.weight_scale = w13_scale_;
       fused_params.x_scale = pertoken_scale.value();
-      fused_params.group_list = selected_expert_info.token_count_slice;
+      // CANN op expects 2D group_list, reshape from 1D to [1, -1]
+      fused_params.group_list =
+          selected_expert_info.token_count_slice.reshape({1, -1});
       std::tie(act_quantized, act_scale) =
           xllm::kernel::moe_grouped_matmul_swiglu_quant(fused_params);
     } else {
