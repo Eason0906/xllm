@@ -445,6 +445,20 @@ struct GroupGemmParams {
   std::optional<torch::Tensor> combine_idx;
 };
 
+// ===== Grouped matmul + SwiGLU + quant (fused) =====
+struct MoeGroupedMatmulSwigluQuantParams {
+  // INT8 input activation [num_tokens, hidden_size]
+  torch::Tensor x;
+  // INT8 expert weight [num_experts, hidden_size, intermediate_size * 2]
+  torch::Tensor weight;
+  // Weight per-channel scale [num_experts, 1, intermediate_size * 2]
+  torch::Tensor weight_scale;
+  // Input per-token scale [num_tokens, 1]
+  torch::Tensor x_scale;
+  // Expert group list (cumulative token counts per expert) [num_experts + 1]
+  torch::Tensor group_list;
+};
+
 struct DequantSwigluQuantParams {
   // Input tensor from grouped matmul output.
   // Typical dtype for W8A8 path: int32.

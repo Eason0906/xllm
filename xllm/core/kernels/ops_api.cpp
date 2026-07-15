@@ -526,6 +526,27 @@ torch::Tensor group_gemm(GroupGemmParams& params) {
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(
+    MoeGroupedMatmulSwigluQuantParams& params) {
+#if defined(USE_NPU)
+  return npu::moe_grouped_matmul_swiglu_quant(
+      params.x, params.weight, params.weight_scale,
+      params.x_scale, params.group_list);
+#else
+  TORCH_CHECK(false,
+              "moe_grouped_matmul_swiglu_quant is only supported on NPU");
+  return {torch::Tensor(), torch::Tensor()};
+#endif
+}
+
+bool moe_grouped_matmul_swiglu_quant_available() {
+#if defined(USE_NPU)
+  return npu::is_moe_grouped_matmul_swiglu_quant_available();
+#else
+  return false;
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor> dequant_swiglu_quant(
     DequantSwigluQuantParams& params) {
 #if defined(USE_NPU)

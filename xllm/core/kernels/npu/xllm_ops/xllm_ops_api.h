@@ -145,6 +145,15 @@ std::tuple<at::Tensor, at::Tensor> dequant_swiglu_quant(
     double glu_alpha,
     double glu_bias);
 
+bool is_moe_grouped_matmul_swiglu_quant_available();
+
+std::tuple<at::Tensor, at::Tensor> moe_grouped_matmul_swiglu_quant(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scale,
+    const at::Tensor& x_scale,
+    const at::Tensor& group_list);
+
 at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& residual,
                    const at::Tensor& post,

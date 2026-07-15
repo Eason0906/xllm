@@ -13,6 +13,7 @@ cc_library(
     quantize.cpp
     quant_dynamic.cpp
     dequant_swiglu_quant.cpp
+    moe_grouped_matmul_swiglu_quant.cpp
     compressor.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp

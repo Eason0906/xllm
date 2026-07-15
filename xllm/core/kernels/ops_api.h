@@ -56,6 +56,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> dynamic_quant(
 
 torch::Tensor group_gemm(GroupGemmParams& params);
 
+std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(
+    MoeGroupedMatmulSwigluQuantParams& params);
+
+bool moe_grouped_matmul_swiglu_quant_available();
+
 std::tuple<torch::Tensor, torch::Tensor> dequant_swiglu_quant(
     DequantSwigluQuantParams& params);
 
