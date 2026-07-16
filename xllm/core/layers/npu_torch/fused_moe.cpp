@@ -892,11 +892,18 @@ torch::Tensor FusedMoEImpl::forward_expert(
                                     "w13");
 
     // Step 5-6: fused grouped matmul + dequant + swiglu + quant (DSV4).
-    // Falls back to separate group_gemm + dequant_swiglu_quant if CANN op
-    // is not deployed.
+    // Falls back to separate group_gemm + dequant_swiglu_quant if the CANN op
+    // is not deployed, OR when the model needs a clamped SwiGLU
+    // (swiglu_mode=1 / clamp_limit>0, e.g. DeepSeek-V4 with swiglu_limit=10).
+    // The fused aclnnMoeGroupedMatmulSwigluQuant wrapper has no parameter to
+    // express the SwiGLU mode/clamp, so it can only run the default
+    // (unclamped, mode-0) SwiGLU. Using it for a clamp-requiring model yields
+    // coherent-but-wrong activations. Only take the fused path when its default
+    // SwiGLU semantics actually match what the model requires.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
-    if (xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
+    if (xllm::kernel::moe_grouped_matmul_swiglu_quant_available() &&
+        !has_effective_swiglu_limit(swiglu_limit_)) {
       VLOG(1) << "Using fused moe_grouped_matmul_swiglu_quant";
       xllm::kernel::MoeGroupedMatmulSwigluQuantParams fused_params;
       fused_params.x = quantized_expand_hidden_states;
