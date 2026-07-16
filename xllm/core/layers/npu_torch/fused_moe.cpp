@@ -904,18 +904,18 @@ torch::Tensor FusedMoEImpl::forward_expert(
       fused_params.weight_scale = w13_scale_;
       fused_params.x_scale = pertoken_scale.value();
       // CANN op expects [num_experts, 2] pairs: [expert_id, token_count].
-      // xLLM has cumulative [0, c1, c2, ..., cN]; convert here.
+      // token_count_slice is already per-expert *counts* (moe_init_routing_v2
+      // is called with expert_tokens_num_type=1), size == num_experts_per_rank_
+      // -- NOT a cumulative sum. Build the pairs entirely on-device: pairing
+      // local expert ids [0, 1, ..., E-1] with the counts. Doing this with
+      // arange+stack (instead of a host-side .accessor loop) avoids a
+      // device->host readback, which would otherwise force a stream sync and
+      // stall ACL graph capture (--enable_graph=true).
       {
-        auto cum = selected_expert_info.token_count_slice;
-        int64_t num_groups = cum.size(0) - 1;
-        auto group_pairs = torch::empty({num_groups, 2}, cum.options());
-        auto cum_acc = cum.accessor<int64_t, 1>();
-        auto pairs_acc = group_pairs.accessor<int64_t, 2>();
-        for (int64_t i = 0; i < num_groups; ++i) {
-          pairs_acc[i][0] = i;
-          pairs_acc[i][1] = cum_acc[i + 1] - cum_acc[i];
-        }
-        fused_params.group_list = group_pairs;
+        const auto counts = selected_expert_info.token_count_slice;
+        const int64_t num_groups = counts.size(0);
+        const auto expert_ids = torch::arange(num_groups, counts.options());
+        fused_params.group_list = torch::stack({expert_ids, counts}, /*dim=*/1);
       }
       std::tie(act_quantized, act_scale) =
           xllm::kernel::moe_grouped_matmul_swiglu_quant(fused_params);

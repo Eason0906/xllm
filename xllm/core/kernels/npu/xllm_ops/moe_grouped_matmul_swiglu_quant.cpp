@@ -41,7 +41,19 @@ std::tuple<at::Tensor, at::Tensor> moe_grouped_matmul_swiglu_quant(
     y_size.push_back(x.size(i));
     scale_size.push_back(x.size(i));
   }
-  y_size.push_back(x.size(x.dim() - 1) / 2);
+  // The swiglu output width equals the MoE intermediate size I, which is a
+  // property of w13 (its output channels are 2*I), NOT of the activation x.
+  // Derive it from weight_scale's last dim (per-channel scale over 2*I) so the
+  // output shape stays correct even when hidden_size != 2*I. Fall back to the
+  // x-based estimate only if weight_scale is not the expected [.., 2*I] shape.
+  int64_t swiglu_out_width = x.size(x.dim() - 1) / 2;
+  if (weight_scale.dim() >= 1) {
+    const int64_t scale_last = weight_scale.size(weight_scale.dim() - 1);
+    if (scale_last > 0 && scale_last % 2 == 0) {
+      swiglu_out_width = scale_last / 2;
+    }
+  }
+  y_size.push_back(swiglu_out_width);
 
   at::Tensor y = at::empty(y_size, x.options().dtype(at::kChar));
   at::Tensor y_scale = at::empty(scale_size, x.options().dtype(at::kFloat));
