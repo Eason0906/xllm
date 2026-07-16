@@ -1967,6 +1967,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
     if (xllm::kernel::grouped_matmul_swiglu_quant_v2_available()) {
+      VLOG(1) << "[FusedMoE] Using fused grouped_matmul_swiglu_quant_v2 "
+                 "(aclnnGroupedMatmulSwigluQuantWeightNZ) path";
       // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNZ call
       // replaces the group_gemm + dequant_swiglu_quant pair.
       // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
@@ -1998,6 +2000,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       std::tie(act_quantized, act_scale) =
           xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
     } else {
+      VLOG(1) << "[FusedMoE] Using fallback group_gemm + dequant_swiglu_quant "
+                 "path (fused v2 op unavailable or disabled)";
       // Fallback: separate group_gemm (int32) + dequant_swiglu_quant.
       std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
       std::vector<torch::Tensor> weight_list = {w13_};
