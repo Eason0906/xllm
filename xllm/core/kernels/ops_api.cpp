@@ -593,6 +593,27 @@ std::tuple<torch::Tensor, torch::Tensor> dequant_swiglu_quant(
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor> grouped_matmul_swiglu_quant_v2(
+    GroupedMatmulSwigluQuantV2Params& params) {
+#if defined(USE_NPU)
+  return npu::grouped_matmul_swiglu_quant_v2(params.x,
+                                             params.weight,
+                                             params.weight_scale,
+                                             params.x_scale,
+                                             params.group_list);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+bool grouped_matmul_swiglu_quant_v2_available() {
+#if defined(USE_NPU)
+  return npu::is_grouped_matmul_swiglu_quant_v2_available();
+#else
+  return false;
+#endif
+}
+
 std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,

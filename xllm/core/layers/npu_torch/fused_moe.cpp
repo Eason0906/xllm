@@ -1963,31 +1963,57 @@ torch::Tensor FusedMoEImpl::forward_expert(
                                     local_intermediate_size_ * 2,
                                     "w13");
 
-    // Step 5-6: first grouped matmul + dequant + swiglu + quant.
+    // Step 5-6: routed-expert grouped matmul + dequant + SwiGLU + quant.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
-    std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
-    std::vector<torch::Tensor> weight_list = {w13_};
-    xllm::kernel::GroupGemmParams group_gemm_params;
-    group_gemm_params.x_list = torch::TensorList(x_list);
-    group_gemm_params.weight_list = torch::TensorList(weight_list);
-    group_gemm_params.group_list = selected_expert_info.token_count_slice;
-    group_gemm_params.split_item = 2;
-    group_gemm_params.group_type = 0;
-    group_gemm_params.group_list_type = 1;
-    group_gemm_params.output_dtype = torch::kInt32;
-    gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
+    if (xllm::kernel::grouped_matmul_swiglu_quant_v2_available()) {
+      // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNZ call
+      // replaces the group_gemm + dequant_swiglu_quant pair.
+      // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
+      // int64 CUMULATIVE offsets (token_count_slice is per-expert counts).
+      if (!w13_swiglu_v2_nz_prepared_) {
+        maybe_trans_nz(w13_);
+        w13_swiglu_v2_nz_prepared_ = true;
+      }
+      // Build cumulative offsets on-device (no host readback -> no stream sync,
+      // graph-capture safe).
+      auto cumulative_group_list =
+          torch::cumsum(selected_expert_info.token_count_slice, /*dim=*/0)
+              .to(torch::kInt64);
 
-    xllm::kernel::DequantSwigluQuantParams params;
-    params.x = gemm1_out;
-    params.weight_scale = w13_scale_;
-    params.activation_scale = pertoken_scale.value();
-    params.group_index = selected_expert_info.token_count_slice;
-    params.activate_left = true;
-    params.quant_mode = 1;
-    apply_ds_v4_dequant_swiglu_quant_v2_params(params, swiglu_limit_);
-    std::tie(act_quantized, act_scale) =
-        xllm::kernel::dequant_swiglu_quant(params);
+      xllm::kernel::GroupedMatmulSwigluQuantV2Params fused_params;
+      fused_params.x = quantized_expand_hidden_states;
+      fused_params.weight = w13_;
+      fused_params.weight_scale = w13_scale_;
+      fused_params.x_scale = pertoken_scale.value();
+      fused_params.group_list = cumulative_group_list;
+      std::tie(act_quantized, act_scale) =
+          xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
+    } else {
+      // Fallback: separate group_gemm (int32) + dequant_swiglu_quant.
+      std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
+      std::vector<torch::Tensor> weight_list = {w13_};
+      xllm::kernel::GroupGemmParams group_gemm_params;
+      group_gemm_params.x_list = torch::TensorList(x_list);
+      group_gemm_params.weight_list = torch::TensorList(weight_list);
+      group_gemm_params.group_list = selected_expert_info.token_count_slice;
+      group_gemm_params.split_item = 2;
+      group_gemm_params.group_type = 0;
+      group_gemm_params.group_list_type = 1;
+      group_gemm_params.output_dtype = torch::kInt32;
+      gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
+
+      xllm::kernel::DequantSwigluQuantParams params;
+      params.x = gemm1_out;
+      params.weight_scale = w13_scale_;
+      params.activation_scale = pertoken_scale.value();
+      params.group_index = selected_expert_info.token_count_slice;
+      params.activate_left = true;
+      params.quant_mode = 1;
+      apply_ds_v4_dequant_swiglu_quant_v2_params(params, swiglu_limit_);
+      std::tie(act_quantized, act_scale) =
+          xllm::kernel::dequant_swiglu_quant(params);
+    }
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
     ensure_group_gemm_weight_layout(w2_,
