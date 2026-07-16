@@ -1972,6 +1972,14 @@ torch::Tensor FusedMoEImpl::forward_expert(
       // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
       // int64 CUMULATIVE offsets (token_count_slice is per-expert counts).
       if (!w13_swiglu_v2_nz_prepared_) {
+        // w13_ was transposed to [E,K,2N] by ensure_group_gemm_weight_layout
+        // above, which yields a NON-contiguous view. npu_format_cast to
+        // FRACTAL_NZ must run on a contiguous tensor, otherwise the NZ storage
+        // is not the 5D [E,2N/32,K/16,16,32] the op requires (it collapses to
+        // a flat 1D storage and the op rejects it). Mirror the proven mc2
+        // preparation order: make contiguous, then NZ-cast.
+        ensure_contiguous_for_fused_mc2(w13_);
+        empty_cache_for_tensor(w13_);
         maybe_trans_nz(w13_);
         w13_swiglu_v2_nz_prepared_ = true;
       }
