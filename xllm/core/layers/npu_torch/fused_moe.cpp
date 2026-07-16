@@ -896,7 +896,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
     // is not deployed.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
-    if (xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
+    if (false && xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
       VLOG(1) << "Using fused moe_grouped_matmul_swiglu_quant";
       xllm::kernel::MoeGroupedMatmulSwigluQuantParams fused_params;
       fused_params.x = quantized_expand_hidden_states;
