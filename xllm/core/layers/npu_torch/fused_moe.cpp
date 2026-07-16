@@ -896,16 +896,27 @@ torch::Tensor FusedMoEImpl::forward_expert(
     // is not deployed.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
-    if (false && xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
+    if (xllm::kernel::moe_grouped_matmul_swiglu_quant_available()) {
       VLOG(1) << "Using fused moe_grouped_matmul_swiglu_quant";
       xllm::kernel::MoeGroupedMatmulSwigluQuantParams fused_params;
       fused_params.x = quantized_expand_hidden_states;
       fused_params.weight = w13_;
       fused_params.weight_scale = w13_scale_;
       fused_params.x_scale = pertoken_scale.value();
-      // CANN op expects 2D group_list, reshape from 1D to [1, -1]
-      fused_params.group_list =
-          selected_expert_info.token_count_slice.reshape({1, -1});
+      // CANN op expects [num_experts, 2] pairs: [expert_id, token_count].
+      // xLLM has cumulative [0, c1, c2, ..., cN]; convert here.
+      {
+        auto cum = selected_expert_info.token_count_slice;
+        int64_t num_groups = cum.size(0) - 1;
+        auto group_pairs = torch::empty({num_groups, 2}, cum.options());
+        auto cum_acc = cum.accessor<int64_t, 1>();
+        auto pairs_acc = group_pairs.accessor<int64_t, 2>();
+        for (int64_t i = 0; i < num_groups; ++i) {
+          pairs_acc[i][0] = i;
+          pairs_acc[i][1] = cum_acc[i + 1] - cum_acc[i];
+        }
+        fused_params.group_list = group_pairs;
+      }
       std::tie(act_quantized, act_scale) =
           xllm::kernel::moe_grouped_matmul_swiglu_quant(fused_params);
     } else {
