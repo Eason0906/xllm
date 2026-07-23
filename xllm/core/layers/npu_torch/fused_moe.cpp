@@ -1923,7 +1923,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
     const torch::Tensor& router_logits,
     const std::optional<torch::Tensor>& shared_output,
     const ModelInputParams& input_params,
-    bool use_mega_moe) {
+    bool use_mega_moe,
+    bool no_decode_phase) {
   if (use_mega_moe) {
     return forward_mega_moe(hidden_states, router_logits, shared_output);
   }
@@ -1942,25 +1943,37 @@ torch::Tensor FusedMoEImpl::forward_expert(
 
   // Optional per-expert token-count logging for routing-distribution / M_e
   // analysis. token_count_slice[e] is the number of tokens routed to local
-  // expert e this call; its sum is M (the grouped-matmul row count). Gated by
-  // env XLLM_LOG_MOE_GROUPLIST=1.
+  // expert e this call; its sum is M (the grouped-matmul row count).
   //
-  // Every forward_expert call is logged (NO sampling) and tagged with a
-  // monotonic call# so each line maps 1:1 to the corresponding grouped-matmul
-  // invocation in a profiler trace: the k-th logged call# is the k-th
-  // grouped_matmul_swiglu_quant_v2 op in the profile. counts are printed on a
-  // single line ([a, b, c, ...]) to keep one call = one log line for easy
-  // correlation.
+  // Gated by env XLLM_LOG_MOE_GROUPLIST:
+  //   unset / 0 / n            -> OFF
+  //   1 / t / y                -> log EVERY forward_expert call (all phases)
+  //   prefill / p / 2          -> log ONLY prefill calls (no_decode phase:
+  //                               PREFILL or CHUNKED_PREFILL), skip decode
+  // The prefill-only mode is meant for profile correlation on the prefill
+  // stage, where M is large enough for the fused op to matter; it keeps the
+  // log short (one line per MoE layer of the single prefill forward).
   //
-  // WARNING: printing forces a device->host copy (stream sync) on every call,
-  // which serializes the pipeline and destroys perf numbers. Use this ONLY for
-  // routing/profile-correlation analysis. Leave it OFF during benchmarks.
-  static const bool log_moe_grouplist = [] {
+  // Every logged call is tagged with a monotonic call# so each line maps 1:1
+  // to the corresponding grouped-matmul invocation in a profiler trace: the
+  // k-th logged call# is the k-th grouped_matmul_swiglu_quant_v2 op in the
+  // profile. counts are printed on a single line ([a, b, c, ...]).
+  //
+  // WARNING: printing forces a device->host copy (stream sync) on every logged
+  // call, which serializes the pipeline and destroys perf numbers. Use this
+  // ONLY for analysis. Leave it OFF during benchmarks.
+  enum class MoeLogMode { kOff, kAll, kPrefillOnly };
+  static const MoeLogMode moe_log_mode = [] {
     const char* v = std::getenv("XLLM_LOG_MOE_GROUPLIST");
-    return v != nullptr &&
-           (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' ||
-            v[0] == 'Y');
+    if (v == nullptr) return MoeLogMode::kOff;
+    if (v[0] == 'p' || v[0] == 'P' || v[0] == '2') return MoeLogMode::kPrefillOnly;
+    if (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')
+      return MoeLogMode::kAll;
+    return MoeLogMode::kOff;
   }();
+  const bool log_moe_grouplist =
+      (moe_log_mode == MoeLogMode::kAll) ||
+      (moe_log_mode == MoeLogMode::kPrefillOnly && no_decode_phase);
   if (log_moe_grouplist) {
     static std::atomic<int64_t> moe_call_counter{0};
     const int64_t call_id = moe_call_counter.fetch_add(1);
@@ -2301,8 +2314,12 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   auto router_logits = gate_(input);
   const bool use_mega_moe =
       mega_moe_enabled_ && input.size(0) <= kMegaMoeMaxTokens;
-  auto output = forward_expert(
-      input, router_logits, shared_output, input_params, use_mega_moe);
+  auto output = forward_expert(input,
+                               router_logits,
+                               shared_output,
+                               input_params,
+                               use_mega_moe,
+                               input_params.meta.batch_forward_type.no_decode());
 
   if (need_slice) {
     const int64_t dp_rank = parallel_args_.dp_local_process_group_->rank();
@@ -2860,8 +2877,13 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   torch::Tensor router_logits = torch::empty(router_shape, input.options());
   const bool use_mega_moe =
       mega_moe_enabled_ && input.size(0) <= kMegaMoeMaxTokens;
-  torch::Tensor output = forward_expert(
-      input, router_logits, shared_output, input_params, use_mega_moe);
+  torch::Tensor output = forward_expert(input,
+                                        router_logits,
+                                        shared_output,
+                                        input_params,
+                                        use_mega_moe,
+                                        input_params.meta.batch_forward_type
+                                            .no_decode());
   preselected_experts_ = std::nullopt;
 
   if (need_slice) {

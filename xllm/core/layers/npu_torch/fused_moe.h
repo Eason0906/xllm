@@ -75,7 +75,8 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& router_logits,
       const std::optional<torch::Tensor>& shared_output,
       const ModelInputParams& input_params,
-      bool use_mega_moe);
+      bool use_mega_moe,
+      bool no_decode_phase = true);
   torch::Tensor forward_with_selected_experts(
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
