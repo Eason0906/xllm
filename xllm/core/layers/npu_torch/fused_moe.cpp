@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -1941,10 +1942,19 @@ torch::Tensor FusedMoEImpl::forward_expert(
 
   // Optional per-expert token-count logging for routing-distribution / M_e
   // analysis. token_count_slice[e] is the number of tokens routed to local
-  // expert e this step; its sum is M (the grouped-matmul row count). Gated by
-  // env XLLM_LOG_MOE_GROUPLIST=1 and rate-limited because printing forces a
-  // device->host copy (stream sync) that would otherwise pollute perf timing.
-  // Leave it OFF during benchmarks.
+  // expert e this call; its sum is M (the grouped-matmul row count). Gated by
+  // env XLLM_LOG_MOE_GROUPLIST=1.
+  //
+  // Every forward_expert call is logged (NO sampling) and tagged with a
+  // monotonic call# so each line maps 1:1 to the corresponding grouped-matmul
+  // invocation in a profiler trace: the k-th logged call# is the k-th
+  // grouped_matmul_swiglu_quant_v2 op in the profile. counts are printed on a
+  // single line ([a, b, c, ...]) to keep one call = one log line for easy
+  // correlation.
+  //
+  // WARNING: printing forces a device->host copy (stream sync) on every call,
+  // which serializes the pipeline and destroys perf numbers. Use this ONLY for
+  // routing/profile-correlation analysis. Leave it OFF during benchmarks.
   static const bool log_moe_grouplist = [] {
     const char* v = std::getenv("XLLM_LOG_MOE_GROUPLIST");
     return v != nullptr &&
@@ -1952,11 +1962,21 @@ torch::Tensor FusedMoEImpl::forward_expert(
             v[0] == 'Y');
   }();
   if (log_moe_grouplist) {
+    static std::atomic<int64_t> moe_call_counter{0};
+    const int64_t call_id = moe_call_counter.fetch_add(1);
     auto counts = selected_expert_info.token_count_slice.to(torch::kCPU);
-    LOG_EVERY_N(INFO, 50)
-        << "[FusedMoE] per-expert token_count (M="
-        << counts.sum().item<int64_t>()
-        << ", experts=" << counts.numel() << "): " << counts;
+    const int64_t n = counts.numel();
+    const auto* cptr = counts.data_ptr<int64_t>();
+    int64_t m_total = 0;
+    std::string counts_str = "[";
+    for (int64_t i = 0; i < n; ++i) {
+      m_total += cptr[i];
+      counts_str += std::to_string(cptr[i]);
+      if (i + 1 < n) counts_str += ", ";
+    }
+    counts_str += "]";
+    LOG(INFO) << "[FusedMoE] call#" << call_id << " per-expert token_count (M="
+              << m_total << ", experts=" << n << "): " << counts_str;
   }
 
   torch::Tensor gemm1_out;
