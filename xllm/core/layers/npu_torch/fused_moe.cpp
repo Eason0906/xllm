@@ -22,6 +22,7 @@ limitations under the License.
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1937,6 +1938,26 @@ torch::Tensor FusedMoEImpl::forward_expert(
   SelectedExpertInfo selected_expert_info;
   torch::Tensor expand_hidden_states = select_experts(
       hidden_states_2d, router_logits_2d, selected_expert_info, input_params);
+
+  // Optional per-expert token-count logging for routing-distribution / M_e
+  // analysis. token_count_slice[e] is the number of tokens routed to local
+  // expert e this step; its sum is M (the grouped-matmul row count). Gated by
+  // env XLLM_LOG_MOE_GROUPLIST=1 and rate-limited because printing forces a
+  // device->host copy (stream sync) that would otherwise pollute perf timing.
+  // Leave it OFF during benchmarks.
+  static const bool log_moe_grouplist = [] {
+    const char* v = std::getenv("XLLM_LOG_MOE_GROUPLIST");
+    return v != nullptr &&
+           (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' ||
+            v[0] == 'Y');
+  }();
+  if (log_moe_grouplist) {
+    auto counts = selected_expert_info.token_count_slice.to(torch::kCPU);
+    LOG_EVERY_N(INFO, 50)
+        << "[FusedMoE] per-expert token_count (M="
+        << counts.sum().item<int64_t>()
+        << ", experts=" << counts.numel() << "): " << counts;
+  }
 
   torch::Tensor gemm1_out;
   torch::Tensor gemm2_out;
