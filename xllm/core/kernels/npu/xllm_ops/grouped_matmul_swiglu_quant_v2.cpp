@@ -53,7 +53,8 @@ bool is_grouped_matmul_swiglu_quant_v2_available() {
 //   weight       int8  (E, K, 2N) FRACTAL_NZ  (caller must NZ-cast)
 //   weight_scale fp32  (E, 2N)  per-channel dequant scale
 //   x_scale      fp32  (M,)     per-token dequant scale
-//   group_list   int64 (E,)     CUMULATIVE token offsets (caller must cumsum)
+//   group_list   int64 (E,)     PER-EXPERT token counts (groupListType=0);
+//                               the op consumes counts natively, no cumsum.
 //   -> y         int8  (M, N),  N = 2N / 2
 //      y_scale   fp32  (M,)     per-token quant scale
 // bias / offset / y_offset are unused for this path (empty tensors).

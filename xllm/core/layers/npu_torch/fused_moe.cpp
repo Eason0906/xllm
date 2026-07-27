@@ -2027,7 +2027,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNZ call
       // replaces the group_gemm + dequant_swiglu_quant pair.
       // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
-      // int64 CUMULATIVE offsets (token_count_slice is per-expert counts).
+      // int64 PER-EXPERT COUNTS (token_count_slice, groupListType=0), the same
+      // layout the fallback group_gemm path uses (group_list_type = 1).
       if (!w13_swiglu_v2_nz_prepared_) {
         // w13_ was transposed to [E,K,2N] by ensure_group_gemm_weight_layout
         // above, which yields a NON-contiguous view. npu_format_cast to
@@ -2040,18 +2041,15 @@ torch::Tensor FusedMoEImpl::forward_expert(
         maybe_trans_nz(w13_);
         w13_swiglu_v2_nz_prepared_ = true;
       }
-      // Build cumulative offsets on-device (no host readback -> no stream sync,
-      // graph-capture safe).
-      auto cumulative_group_list =
-          torch::cumsum(selected_expert_info.token_count_slice, /*dim=*/0)
-              .to(torch::kInt64);
-
+      // Pass per-expert token counts directly (groupListType=0). The WeightNZ
+      // int8 op consumes the count layout natively, so we avoid the per-decode
+      // torch::cumsum that fell back to aclnnCumsum_CumsumAiCpu_Cumsum on AI CPU.
       xllm::kernel::GroupedMatmulSwigluQuantV2Params fused_params;
       fused_params.x = quantized_expand_hidden_states;
       fused_params.weight = w13_;
       fused_params.weight_scale = w13_scale_;
       fused_params.x_scale = pertoken_scale.value();
-      fused_params.group_list = cumulative_group_list;
+      fused_params.group_list = selected_expert_info.token_count_slice;
       std::tie(act_quantized, act_scale) =
           xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
     } else {
