@@ -172,12 +172,15 @@ std::tuple<at::Tensor, at::Tensor> dequant_swiglu_quant(
 
 bool is_grouped_matmul_swiglu_quant_v2_available();
 
+// Fused MoE grouped matmul via aclnnGroupedMatmulSwigluQuantWeightNzV2. Takes
+// per-expert COUNTS group_list (groupListType=1) -> no host-side cumsum.
 std::tuple<at::Tensor, at::Tensor> grouped_matmul_swiglu_quant_v2(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& weight_scale,
     const at::Tensor& x_scale,
-    const at::Tensor& group_list);
+    const at::Tensor& group_list,
+    double swiglu_limit);
 
 at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& residual,

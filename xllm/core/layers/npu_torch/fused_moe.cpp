@@ -2023,14 +2023,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
     if (xllm::kernel::grouped_matmul_swiglu_quant_v2_available()) {
       LOG_FIRST_N(INFO, 1)
           << "[FusedMoE] Using FUSED grouped_matmul_swiglu_quant_v2 "
-             "(aclnnGroupedMatmulSwigluQuantWeightNZ) path";
-      // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNZ call
+             "(aclnnGroupedMatmulSwigluQuantWeightNzV2) path";
+      // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNzV2 call
       // replaces the group_gemm + dequant_swiglu_quant pair.
       // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
-      // int64 CUMULATIVE offsets. The built-in WeightNZ op is type-fixed to
-      // cumulative; feeding raw per-expert counts makes it read out-of-range
-      // rows (MTE DDR out-of-range -> aicore exception) once counts are
-      // unequal, so the cumsum below is REQUIRED, not an optimization target.
+      // int64 per-expert COUNTS (groupListType=1) -- no cumsum needed.
       if (!w13_swiglu_v2_nz_prepared_) {
         // w13_ was transposed to [E,K,2N] by ensure_group_gemm_weight_layout
         // above, which yields a NON-contiguous view. npu_format_cast to
@@ -2043,18 +2040,15 @@ torch::Tensor FusedMoEImpl::forward_expert(
         maybe_trans_nz(w13_);
         w13_swiglu_v2_nz_prepared_ = true;
       }
-      // Build cumulative offsets on-device (no host readback -> no stream sync,
-      // graph-capture safe). Required by the WeightNZ op's group_list contract.
-      auto cumulative_group_list =
-          torch::cumsum(selected_expert_info.token_count_slice, /*dim=*/0)
-              .to(torch::kInt64);
-
+      // WeightNzV2 takes group_list as raw per-expert COUNTS (groupListType=1),
+      // so NO host-side cumsum is needed. token_count_slice is already int64.
       xllm::kernel::GroupedMatmulSwigluQuantV2Params fused_params;
       fused_params.x = quantized_expand_hidden_states;
       fused_params.weight = w13_;
       fused_params.weight_scale = w13_scale_;
       fused_params.x_scale = pertoken_scale.value();
-      fused_params.group_list = cumulative_group_list;
+      fused_params.group_list = selected_expert_info.token_count_slice;
+      fused_params.swiglu_limit = swiglu_limit_;
       std::tie(act_quantized, act_scale) =
           xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
     } else {

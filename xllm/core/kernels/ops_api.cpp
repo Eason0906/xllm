@@ -600,7 +600,8 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_matmul_swiglu_quant_v2(
                                              params.weight,
                                              params.weight_scale,
                                              params.x_scale,
-                                             params.group_list);
+                                             params.group_list,
+                                             params.swiglu_limit);
 #else
   NOT_IMPLEMENTED();
 #endif
