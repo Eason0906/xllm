@@ -504,7 +504,8 @@ struct GroupedMatmulSwigluQuantV2Params {
   torch::Tensor weight_scale;
   // FP32 per-token input dequant scale [M].
   torch::Tensor x_scale;
-  // INT64 per-expert token counts [E] (groupListType=0), NOT cumulative.
+  // INT64 CUMULATIVE per-expert token offsets [E] (op is type-fixed to
+  // cumulative; raw counts cause MTE DDR out-of-range on unequal counts).
   torch::Tensor group_list;
 };
 
