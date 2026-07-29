@@ -2049,6 +2049,28 @@ torch::Tensor FusedMoEImpl::forward_expert(
       fused_params.x_scale = pertoken_scale.value();
       fused_params.group_list = selected_expert_info.token_count_slice;
       fused_params.swiglu_limit = swiglu_limit_;
+      // One-shot diagnostic: the "Cannot find bin" integral-key mismatch starts
+      // at the weight_scale slot. Print each tensor's real dtype + NPU format so
+      // we can see what actually reaches the op (vs the compiled A8W8 signature:
+      // x=int8/ND, weight=int8/FRACTAL_NZ, weight_scale=fp32|fp16|bf16 / ND,
+      // x_scale=fp32/ND, group_list=int64/ND). Remove once resolved.
+      LOG_FIRST_N(WARNING, 1)
+          << "[FusedMoE][V2-diag] x{dtype=" << fused_params.x.dtype()
+          << ",fmt=" << get_tensor_npu_format(fused_params.x)
+          << ",sizes=" << fused_params.x.sizes() << "}"
+          << " weight{dtype=" << fused_params.weight.dtype()
+          << ",fmt=" << get_tensor_npu_format(fused_params.weight)
+          << ",sizes=" << fused_params.weight.sizes() << "}"
+          << " weight_scale{dtype=" << fused_params.weight_scale.dtype()
+          << ",fmt=" << get_tensor_npu_format(fused_params.weight_scale)
+          << ",sizes=" << fused_params.weight_scale.sizes()
+          << ",contig=" << fused_params.weight_scale.is_contiguous() << "}"
+          << " x_scale{dtype=" << fused_params.x_scale.dtype()
+          << ",fmt=" << get_tensor_npu_format(fused_params.x_scale)
+          << ",sizes=" << fused_params.x_scale.sizes() << "}"
+          << " group_list{dtype=" << fused_params.group_list.dtype()
+          << ",fmt=" << get_tensor_npu_format(fused_params.group_list)
+          << ",sizes=" << fused_params.group_list.sizes() << "}";
       std::tie(act_quantized, act_scale) =
           xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
     } else {
