@@ -44,6 +44,8 @@ CombinedDraftExecutionPath classify_combined_draft_execution_path(
     std::string_view model_type) {
   if (model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp") {
     return CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
+  } else if (model_type == "deepseek_v4_mtp") {
+    return CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION;
   }
   return CombinedDraftExecutionPath::UNSUPPORTED;
 }

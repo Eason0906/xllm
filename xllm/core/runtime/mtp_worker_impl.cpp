@@ -469,8 +469,7 @@ bool is_qwen3_5_target_model_type(const std::string& model_type) {
 }
 
 bool is_qwen3_5_draft_model_type(const std::string& model_type) {
-  return mtp_async::classify_combined_draft_execution_path(model_type) ==
-         mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
+  return model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
 }
 
 bool is_mimo_target_model_type(const std::string& model_type) {
@@ -1519,9 +1518,13 @@ bool MTPWorkerImpl::supports_combined_first_draft_execution() const {
   }
 
   const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
-  return mtp_async::classify_combined_draft_execution_path(
-             draft_args.model_type()) ==
-             mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION &&
+  const auto execution_path =
+      mtp_async::classify_combined_draft_execution_path(
+          draft_args.model_type());
+  return (execution_path ==
+              mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION ||
+          execution_path ==
+              mtp_async::CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION) &&
          device_.unwrap().is_privateuseone() &&
          ::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH";
 #else

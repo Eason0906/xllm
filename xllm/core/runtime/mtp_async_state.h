@@ -25,6 +25,7 @@ namespace xllm::mtp_async {
 enum class CombinedDraftExecutionPath {
   UNSUPPORTED,
   QWEN3_5_PAGED_ATTENTION,
+  DEEPSEEK_V4_PAGED_ATTENTION,
 };
 
 CombinedDraftExecutionPath classify_combined_draft_execution_path(
