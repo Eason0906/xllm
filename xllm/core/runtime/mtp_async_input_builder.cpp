@@ -88,20 +88,42 @@ void prepare_next_draft_from_accepted_state(
     bool use_chunked_prefill,
     int32_t block_size) {
 #if defined(USE_NPU)
-  if (block_table_source.input_params.multi_block_tables.empty()) {
-    const auto output = kernel::npu::try_mtp_prepare_next_draft(
-        accepted_tokens,
-        accepted_embeddings,
-        embedding_placeholder,
-        base_positions,
-        base_kv_seq_lens,
-        block_table_source.input_params.attention.device.block_tables,
-        block_size);
-    if (output.has_value()) {
-      apply_mtp_prepare_output(draft_input, *output, use_chunked_prefill);
-      return;
-    }
+  // 单 block_table (PagedAttention) 与 multi_block_tables (DSA) 都走融合
+  // 算子。DSA 模式下 block_tables 只用于 kernel 内部 cache_slot 计算，该
+  // 结果会被下方覆盖为全 0 (DSA 使用 multi_block_tables 自行推导 slot
+  // 映射)，因此传一个满足 kernel 前置检查的占位表即可。
+  const bool is_multi_block =
+      !block_table_source.input_params.multi_block_tables.empty();
+  torch::Tensor block_tables =
+      block_table_source.input_params.attention.device.block_tables;
+  if (is_multi_block) {
+    block_tables = torch::zeros(
+        {accepted_tokens.size(0), 1},
+        torch::TensorOptions()
+            .dtype(torch::kInt)
+            .device(accepted_tokens.device()));
   }
+  const auto output = kernel::npu::try_mtp_prepare_next_draft(
+      accepted_tokens,
+      accepted_embeddings,
+      embedding_placeholder,
+      base_positions,
+      base_kv_seq_lens,
+      block_tables,
+      block_size);
+  if (output.has_value()) {
+    VLOG(1) << "[MTP-PREPARE] using fused kernel mtp_prepare_next_draft"
+            << (is_multi_block ? " (DSA multi-block placeholder)" : "");
+    apply_mtp_prepare_output(draft_input, *output, use_chunked_prefill);
+    if (is_multi_block) {
+      // DSA: cache_slots 无意义，覆盖为 0 (与 fallback 行为一致)。
+      draft_input.input_params.attention.device.new_cache_slots =
+          torch::zeros_like(
+              draft_input.input_params.attention.device.new_cache_slots);
+    }
+    return;
+  }
+  VLOG(1) << "[MTP-PREPARE] fused kernel unsupported, fallback to torch";
 #endif
 
   AcceptedState state = build_accepted_state(accepted_tokens,

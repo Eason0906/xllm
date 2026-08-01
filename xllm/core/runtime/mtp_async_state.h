@@ -42,6 +42,7 @@ int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
 enum class CombinedDraftExecutionPath {
   UNSUPPORTED,
   QWEN3_5_PAGED_ATTENTION,
+  DEEPSEEK_V4_PAGED_ATTENTION,
 };
 
 CombinedDraftExecutionPath classify_combined_draft_execution_path(

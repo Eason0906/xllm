@@ -1660,9 +1660,13 @@ bool MTPWorkerImpl::supports_combined_first_draft_execution() const {
   }
 
   const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
-  return mtp_async::classify_combined_draft_execution_path(
-             draft_args.model_type()) ==
-             mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION &&
+  const auto execution_path =
+      mtp_async::classify_combined_draft_execution_path(
+          draft_args.model_type());
+  return (execution_path ==
+              mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION ||
+          execution_path ==
+              mtp_async::CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION) &&
          device_.unwrap().is_privateuseone() &&
          ::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH";
 #else
