@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
 #include "core/layers/common/dsa_topk_share_plan.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/runtime/mtp_async_input_builder.h"
 #include "core/runtime/mtp_async_state.h"
 #include "spec_input_builder.h"

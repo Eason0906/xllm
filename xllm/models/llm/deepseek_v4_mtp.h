@@ -664,6 +664,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     return build_attention_metadata_for_forward(positions, input_params);
   }
 
+  std::shared_ptr<layer::AttentionMetadata>
   build_attention_metadata_for_forward(const torch::Tensor& positions,
                                        const ModelInputParams& input_params) {
     auto modified_input_params = input_params;

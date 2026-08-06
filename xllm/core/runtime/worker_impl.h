@@ -64,6 +64,9 @@ class WorkerImpl {
 
   virtual ~WorkerImpl();
 
+  // Exposes the causal LM model for eager C-scheme metadata prebuilding.
+  CausalLM* get_model() { return model_.get(); }
+
   // initialize model, cache manager. blocking call
   virtual bool init_model(ModelContext& context) = 0;
 
