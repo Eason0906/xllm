@@ -67,6 +67,16 @@ class CausalLM : public torch::nn::Module {
 
   virtual bool requires_graph_forward_metadata() { return false; }
 
+  // Eager C-scheme hook: pre-build attention metadata ahead of the forward.
+  // Default returns null (no prebuild); models that build metadata on the
+  // eager path (e.g. DeepSeek V4 MTP) override to prebuild and mark the
+  // metadata as reusable.
+  virtual std::shared_ptr<layer::AttentionMetadata> prebuild_attention_metadata(
+      const torch::Tensor&,
+      const ModelInputParams&) {
+    return nullptr;
+  }
+
   virtual bool is_hybrid_linear_attention() { return false; }
 
   virtual bool supports_mla_graph_kv_bucketing() const { return false; }

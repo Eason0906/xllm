@@ -1727,6 +1727,33 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
                               /*force_two_rows=*/true,
                               /*wait_for_compute_stream=*/false);
   combined_input.skip_sampling_for_logits_only = false;
+
+  // C-scheme (eager draft): the draft model is not graph-captured, so its DSA
+  // attention metadata is built on the eager path inside the draft forward.
+  // Pre-build it here from the template's predicted positions so the AI_CPU
+  // metadata compute overlaps the AI_CORE target compute. The draft forward
+  // reuses the prebuilt metadata (attn_metadata already populated); on token
+  // rejection the repair step clears dsa.metadata_prebuilt to force a rebuild.
+  prebuild_draft_dsa_metadata(combined_input);
+}
+
+void MTPWorkerImpl::prebuild_draft_dsa_metadata(ForwardInput& combined_input) {
+  if (draft_impl_ == nullptr || draft_impl_->get_model() == nullptr) {
+    return;
+  }
+  CausalLM* draft_model = draft_impl_->get_model();
+  auto prebuilt = draft_model->prebuild_attention_metadata(
+      combined_input.positions, combined_input.input_params);
+  if (prebuilt) {
+    // Attaching the prebuilt metadata is itself the reuse marker: the draft
+    // forward sees a non-null attn_metadata and skips building its own. On
+    // token rejection the repair step clears it (and metadata_prebuilt) so the
+    // draft forward rebuilds with the corrected KV lengths.
+    if (prebuilt->dsa_metadata) {
+      prebuilt->dsa_metadata->metadata_prebuilt = true;
+    }
+    combined_input.input_params.attn_metadata = std::move(prebuilt);
+  }
 }
 
 bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
@@ -1737,6 +1764,7 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
   // prepare_draft_extend_inputs ran with force_two_rows, so the template holds
   // an interleaved [repair, current] pair per sequence.
   constexpr int32_t kRowsPerSequence = 2;
+  bool all_accepted = true;
   if (host_kv_seq_lens.size() !=
       static_cast<size_t>(num_sequences) * kRowsPerSequence) {
     LOG(ERROR) << "unexpected prelaunch host KV length count, expected "
@@ -1774,6 +1802,9 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
     // the shortfall. Both rows of a sequence share the same delta because they
     // are the same sequence one position apart.
     const int32_t delta = lengths[seq_id] - num_speculative_tokens;
+    if (delta != 0) {
+      all_accepted = false;
+    }
     for (int32_t row = 0; row < kRowsPerSequence; ++row) {
       const size_t idx = static_cast<size_t>(seq_id) * kRowsPerSequence + row;
       const int32_t repaired = host_kv_seq_lens[idx] + delta;
@@ -1787,6 +1818,14 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
     }
   }
   combined_input.input_params.meta.kv_max_seq_len = kv_max_seq_len;
+
+  // Eager C-scheme: the prebuilt metadata assumed full acceptance. If any
+  // sequence rejected a token, the corrected host KV lengths differ from the
+  // prediction, so the prebuilt DSA metadata is stale. Detach it and let the
+  // draft forward rebuild with the corrected lengths.
+  if (!all_accepted) {
+    combined_input.input_params.attn_metadata.reset();
+  }
   return true;
 }
 

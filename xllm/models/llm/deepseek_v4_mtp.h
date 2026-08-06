@@ -652,6 +652,18 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   }
 
   std::shared_ptr<layer::AttentionMetadata>
+  // Eager C-scheme hook: pre-build the DSA attention metadata ahead of the
+  // draft forward with the template's predicted positions so the AI_CPU
+  // metadata compute overlaps the AI_CORE target compute. The draft forward
+  // reuses it when attn_metadata is already populated (all tokens accepted);
+  // repair_host_kv_seq_lens_for_host_metadata clears dsa.metadata_prebuilt to
+  // force a rebuild on rejection.
+  std::shared_ptr<layer::AttentionMetadata> prebuild_attention_metadata(
+      const torch::Tensor& positions,
+      const ModelInputParams& input_params) {
+    return build_attention_metadata_for_forward(positions, input_params);
+  }
+
   build_attention_metadata_for_forward(const torch::Tensor& positions,
                                        const ModelInputParams& input_params) {
     auto modified_input_params = input_params;
@@ -1140,6 +1152,14 @@ class DeepseekV4MtpForCausalLMImpl final
 
   bool requires_graph_forward_metadata() {
     return this->model_->requires_graph_forward_metadata();
+  }
+
+  // Eager C-scheme: pre-build DSA metadata ahead of the draft forward (draft
+  // is not graph-captured; metadata is built on the eager path).
+  std::shared_ptr<layer::AttentionMetadata> prebuild_attention_metadata(
+      const torch::Tensor& positions,
+      const ModelInputParams& input_params) {
+    return this->model_->prebuild_attention_metadata(positions, input_params);
   }
 
   std::unique_ptr<ModelGraphMetadataState>

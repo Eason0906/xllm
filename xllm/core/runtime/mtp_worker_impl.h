@@ -181,6 +181,11 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool can_use_combined_first_draft() const;
   void prepare_next_first_draft_template(const ForwardInput& input,
                                          ForwardInput& combined_input);
+  // Eager C-scheme: pre-build the draft's DSA attention metadata from the
+  // template's predicted positions so the AI_CPU metadata compute overlaps the
+  // AI_CORE target compute (the draft is not graph-captured). Cleared by
+  // repair_host_kv_seq_lens_for_host_metadata on token rejection.
+  void prebuild_draft_dsa_metadata(ForwardInput& combined_input);
   void enqueue_next_first_draft(const ForwardInput& input,
                                 const SampleOutput& validate_output,
                                 const torch::Tensor& base_positions,

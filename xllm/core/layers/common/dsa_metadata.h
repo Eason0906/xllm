@@ -85,6 +85,11 @@ struct DSAMetadata {
   // not perform host/device copies in this mode.
   bool is_acl_graph = false;
 
+  // True when the DSA metadata was pre-built ahead of the draft forward
+  // (eager C-scheme) with the template's predicted positions. Cleared on token
+  // rejection so the draft forward rebuilds with corrected KV lengths.
+  bool metadata_prebuilt = false;
+
   // cp_input_dict: context-parallel inputs placeholder (reserved, optional)
   std::unordered_map<std::string, torch::Tensor> cp_input_dict;
 
