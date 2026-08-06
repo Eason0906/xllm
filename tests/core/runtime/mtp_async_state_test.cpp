@@ -86,6 +86,8 @@ TEST(MtpAsyncStateTest, LeavesOrdinaryEagerTokensUnchanged) {
 
   EXPECT_EQ(materialized.data_ptr(), verify_tokens.data_ptr());
   EXPECT_TRUE(torch::equal(materialized, verify_tokens));
+}
+
 // DeepSeek V4 gets its own path because it builds attention metadata on the
 // host: the async handoff must repair host KV lengths for it, which the
 // Qwen3.5 PagedAttention path does not need.
