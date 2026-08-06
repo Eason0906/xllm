@@ -48,6 +48,8 @@ TEST(MtpAsyncStateTest, ClassifiesSupportedCombinedDraftExecutionPaths) {
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
   EXPECT_EQ(classify_combined_draft_execution_path("qwen3_5_moe_mtp"),
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v4_mtp"),
+            CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION);
   EXPECT_EQ(classify_combined_draft_execution_path("glm_moe_dsa_mtp"),
             CombinedDraftExecutionPath::UNSUPPORTED);
   EXPECT_EQ(classify_combined_draft_execution_path("mimo_mtp"),
@@ -84,6 +86,79 @@ TEST(MtpAsyncStateTest, LeavesOrdinaryEagerTokensUnchanged) {
 
   EXPECT_EQ(materialized.data_ptr(), verify_tokens.data_ptr());
   EXPECT_TRUE(torch::equal(materialized, verify_tokens));
+// DeepSeek V4 gets its own path because it builds attention metadata on the
+// host: the async handoff must repair host KV lengths for it, which the
+// Qwen3.5 PagedAttention path does not need.
+TEST(MtpAsyncStateTest, SeparatesDeepseekV4FromQwen35ExecutionPath) {
+  EXPECT_NE(classify_combined_draft_execution_path("deepseek_v4_mtp"),
+            CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
+  EXPECT_NE(classify_combined_draft_execution_path("deepseek_v4_mtp"),
+            CombinedDraftExecutionPath::UNSUPPORTED);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v4"),
+            CombinedDraftExecutionPath::UNSUPPORTED);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v32_mtp"),
+            CombinedDraftExecutionPath::UNSUPPORTED);
+}
+
+// Sequence-scoped layout (chunked-prefill / Qwen3.5): one entry per sequence
+// holding K[s]+num_spec.
+TEST(MtpAsyncStateTest, DerivesBaseKvSeqLensFromSequenceScopedLayout) {
+  const torch::Tensor validate_kv_seq_lens =
+      torch::tensor({103, 203, 303}, torch::kInt);
+
+  const torch::Tensor base =
+      derive_base_kv_seq_lens(validate_kv_seq_lens,
+                              /*batch_size=*/3,
+                              /*num_val_tokens=*/4,
+                              /*num_speculative_tokens=*/3);
+
+  EXPECT_TRUE(torch::equal(base, torch::tensor({100, 200, 300}, torch::kInt)));
+}
+
+// Row-scoped layout (eager DECODE / DeepSeek V4): num_val_tokens entries per
+// sequence, row-major, with K[s] already in column 0. Slicing the leading
+// batch_size entries would return sequence 0's rows instead.
+TEST(MtpAsyncStateTest, DerivesBaseKvSeqLensFromRowScopedLayout) {
+  const torch::Tensor validate_kv_seq_lens = torch::tensor(
+      {100, 101, 102, 103, 200, 201, 202, 203, 300, 301, 302, 303},
+      torch::kInt);
+
+  const torch::Tensor base =
+      derive_base_kv_seq_lens(validate_kv_seq_lens,
+                              /*batch_size=*/3,
+                              /*num_val_tokens=*/4,
+                              /*num_speculative_tokens=*/3);
+
+  EXPECT_TRUE(torch::equal(base, torch::tensor({100, 200, 300}, torch::kInt)));
+}
+
+// Regression guard: the row-scoped layout must not be read as sequence-scoped.
+// The old slice-the-leading-batch_size derivation returned sequence 0's rows
+// {100, 101} and then subtracted num_spec, yielding {98, 99}: both values wrong
+// and sequence 1 silently aliased to sequence 0.
+TEST(MtpAsyncStateTest, RowScopedLayoutDoesNotAliasFirstSequenceRows) {
+  const torch::Tensor validate_kv_seq_lens =
+      torch::tensor({100, 101, 102, 500, 501, 502}, torch::kInt);
+
+  const torch::Tensor base =
+      derive_base_kv_seq_lens(validate_kv_seq_lens,
+                              /*batch_size=*/2,
+                              /*num_val_tokens=*/3,
+                              /*num_speculative_tokens=*/2);
+
+  EXPECT_TRUE(torch::equal(base, torch::tensor({100, 500}, torch::kInt)));
+}
+
+// A single sequence does not rescue the row-scoped layout: entry 0 is K[0]
+// itself, so the old derivation still subtracted num_spec and returned {98}.
+// The two layouts only coincide when num_speculative_tokens is 0.
+TEST(MtpAsyncStateTest, RowScopedLayoutIsStillRepairedForSingleSequence) {
+  EXPECT_TRUE(torch::equal(
+      derive_base_kv_seq_lens(torch::tensor({100, 101, 102}, torch::kInt),
+                              /*batch_size=*/1,
+                              /*num_val_tokens=*/3,
+                              /*num_speculative_tokens=*/2),
+      torch::tensor({100}, torch::kInt)));
 }
 
 TEST(MtpAsyncStateTest, BuildsMixedAcceptanceStateWithoutHostRoundTrip) {

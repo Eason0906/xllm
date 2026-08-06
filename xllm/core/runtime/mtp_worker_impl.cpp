@@ -529,8 +529,7 @@ KVCacheShape MTPDraftKVCacheShape(const KVCacheShape& target_shape,
 }
 
 bool is_qwen3_5_draft_model_type(const std::string& model_type) {
-  return mtp_async::classify_combined_draft_execution_path(model_type) ==
-         mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
+  return model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
 }
 
 }  // namespace
@@ -1476,8 +1475,6 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
       << "validate positions must contain one row per speculative token";
   const torch::Tensor& validate_kv_seq_lens =
       validate_input.input_params.attention.device.kv_seq_lens;
-  CHECK_GE(validate_kv_seq_lens.numel(), batch_size)
-      << "validate KV lengths must be sequence-scoped";
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(val_output.next_tokens);
   torch::Tensor accepted_tokens_cpu_result = accepted_tokens_host;
@@ -1499,8 +1496,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
     base_positions = validate_input.positions.view({batch_size, num_val_tokens})
                          .select(/*dim=*/1, /*index=*/0)
                          .contiguous();
-    base_kv_seq_lens = validate_kv_seq_lens.flatten().slice(0, 0, batch_size) -
-                       options_.num_speculative_tokens();
+    // The validate KV length layout is model-dependent; the helper normalizes
+    // both strides down to per-sequence K[s].
+    base_kv_seq_lens = mtp_async::derive_base_kv_seq_lens(
+        validate_kv_seq_lens,
+        batch_size,
+        num_val_tokens,
+        options_.num_speculative_tokens());
 
     accepted_tokens_host.copy_(val_output.next_tokens,
                                /*non_blocking=*/true);
@@ -1727,6 +1729,67 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
   combined_input.skip_sampling_for_logits_only = false;
 }
 
+bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
+    int32_t num_sequences,
+    ForwardInput& combined_input) {
+  std::vector<int32_t>& host_kv_seq_lens =
+      combined_input.input_params.attention.host.kv_seq_lens;
+  // prepare_draft_extend_inputs ran with force_two_rows, so the template holds
+  // an interleaved [repair, current] pair per sequence.
+  constexpr int32_t kRowsPerSequence = 2;
+  if (host_kv_seq_lens.size() !=
+      static_cast<size_t>(num_sequences) * kRowsPerSequence) {
+    LOG(ERROR) << "unexpected prelaunch host KV length count, expected "
+               << num_sequences * kRowsPerSequence << ", got "
+               << host_kv_seq_lens.size();
+    return false;
+  }
+
+  const torch::Tensor& accepted_tokens_host =
+      pending_target_context_.accepted_tokens_host;
+  if (!accepted_tokens_host.defined() || accepted_tokens_host.dim() != 2 ||
+      accepted_tokens_host.size(0) < num_sequences) {
+    LOG(ERROR) << "accepted tokens host buffer unusable for host KV repair";
+    return false;
+  }
+  // The staged event covers the D2H copy of the accepted tokens. This host wait
+  // is the cost of building DSA metadata on the host: the slot mapping needs
+  // real accepted lengths, so the template's optimistic values cannot stand.
+  if (pending_target_context_.ready_event != nullptr &&
+      !pending_target_context_.ready_event->synchronize()) {
+    LOG(ERROR) << "failed to wait for accepted tokens before host KV repair";
+    return false;
+  }
+
+  // Mirror build_accepted_state: accepted_length = count of non-negative
+  // entries in the row.
+  const torch::Tensor accepted_lengths =
+      accepted_tokens_host.ge(0).sum(/*dim=*/1).to(torch::kInt);
+  const auto lengths = accepted_lengths.accessor<int32_t, 1>();
+  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+
+  int32_t kv_max_seq_len = 0;
+  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    // The template assumed every speculative token was accepted; correct it by
+    // the shortfall. Both rows of a sequence share the same delta because they
+    // are the same sequence one position apart.
+    const int32_t delta = lengths[seq_id] - num_speculative_tokens;
+    for (int32_t row = 0; row < kRowsPerSequence; ++row) {
+      const size_t idx = static_cast<size_t>(seq_id) * kRowsPerSequence + row;
+      const int32_t repaired = host_kv_seq_lens[idx] + delta;
+      if (repaired <= 0) {
+        LOG(ERROR) << "non-positive repaired host KV length, seq_id=" << seq_id
+                   << ", row=" << row << ", value=" << repaired;
+        return false;
+      }
+      host_kv_seq_lens[idx] = repaired;
+      kv_max_seq_len = std::max(kv_max_seq_len, repaired);
+    }
+  }
+  combined_input.input_params.meta.kv_max_seq_len = kv_max_seq_len;
+  return true;
+}
+
 void MTPWorkerImpl::enqueue_next_first_draft(
     const ForwardInput& input,
     const SampleOutput& validate_output,
@@ -1738,6 +1801,20 @@ void MTPWorkerImpl::enqueue_next_first_draft(
   CHECK(validate_output.next_tokens.defined());
   CHECK(validate_output.embeddings.defined());
   CHECK(embedding_cache_ != nullptr);
+
+  // Models that derive attention metadata from host state cannot run on the
+  // template's all-accepted assumption. DSA expands block tables to slot
+  // mappings in a host loop driven by host.kv_seq_lens, so an inflated length
+  // silently produces a wrong slot mapping instead of failing.
+  if (mtp_async::classify_combined_draft_execution_path(
+          draft_impl_->context_.get_model_args().model_type()) ==
+      mtp_async::CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION) {
+    if (!repair_host_kv_seq_lens_for_host_metadata(
+            input.input_params.meta.num_sequences, combined_input)) {
+      // Skip the prelaunch and let the synchronous path rebuild this draft.
+      return;
+    }
+  }
 
   c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
   wait_metadata_ready_event(combined_input, *compute_stream_);

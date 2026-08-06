@@ -186,6 +186,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                 const torch::Tensor& base_positions,
                                 const torch::Tensor& base_kv_seq_lens,
                                 ForwardInput combined_input);
+  // Repairs the optimistic host KV lengths baked into the prelaunch template
+  // for models that build attention metadata on the host (DSA). Returns false
+  // when the accepted lengths could not be read, meaning the caller must not
+  // launch the prelaunched draft.
+  bool repair_host_kv_seq_lens_for_host_metadata(int32_t num_sequences,
+                                                 ForwardInput& combined_input);
   bool pending_draft_context_matches(const ForwardInput& input) const;
 
  protected:

@@ -92,6 +92,36 @@ torch::Tensor materialize_speculative_verify_tokens(
   return verify_tokens;
 }
 
+torch::Tensor derive_base_kv_seq_lens(
+    const torch::Tensor& validate_kv_seq_lens,
+    int64_t batch_size,
+    int64_t num_val_tokens,
+    int32_t num_speculative_tokens) {
+  CHECK(validate_kv_seq_lens.defined());
+  CHECK_GT(batch_size, 0);
+  CHECK_GT(num_val_tokens, 0);
+  const int64_t numel = validate_kv_seq_lens.numel();
+  CHECK_EQ(numel % batch_size, 0)
+      << "validate KV lengths must be a whole multiple of the batch size, "
+         "numel="
+      << numel << ", batch_size=" << batch_size;
+  const int64_t stride = numel / batch_size;
+  CHECK(stride == 1 || stride == num_val_tokens)
+      << "unexpected validate KV length layout, stride=" << stride
+      << ", num_val_tokens=" << num_val_tokens;
+
+  torch::Tensor base = validate_kv_seq_lens.flatten()
+                           .view({batch_size, stride})
+                           .select(/*dim=*/1, /*index=*/0)
+                           .contiguous();
+  if (stride == 1) {
+    // The sequence-scoped layout stores the post-validation length
+    // K[s]+num_spec; the row-scoped layout already has K[s] in column 0.
+    base = base - num_speculative_tokens;
+  }
+  return base;
+}
+
 AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
                                    const torch::Tensor& accepted_embeddings,
                                    const torch::Tensor& embedding_placeholder,

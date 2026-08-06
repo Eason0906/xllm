@@ -55,6 +55,20 @@ torch::Tensor materialize_speculative_verify_tokens(
     const torch::Tensor& verify_tokens,
     const std::vector<torch::Tensor>& draft_token_sources);
 
+// Recovers the per-sequence KV length K[s] that held before target validation
+// from the validate input's KV lengths. Two validate layouts exist and they
+// disagree on stride:
+//   * chunked-prefill (Qwen3.5/MiMo): one entry per sequence, K[s]+num_spec.
+//   * eager DECODE (DeepSeek V4): one entry per validate row, row-major
+//     [K0, K0+1, ..., K1, K1+1, ...] with batch_size*num_val_tokens entries.
+// Slicing the leading batch_size entries only works for the first layout; for
+// the second it reads sequence 0's rows instead of each sequence's row 0.
+torch::Tensor derive_base_kv_seq_lens(
+    const torch::Tensor& validate_kv_seq_lens,
+    int64_t batch_size,
+    int64_t num_val_tokens,
+    int32_t num_speculative_tokens);
+
 // Device-resident state derived from target verification. base_positions and
 // base_kv_seq_lens point at the logical position immediately after the accepted
 // prefix and are therefore the base of the next draft iteration.
