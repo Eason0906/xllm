@@ -447,6 +447,18 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
         << "[DeepseekV4Mtp] ACL graph requires DSA metadata";
   }
 
+ public:
+  // Eager C-scheme hook: pre-build the DSA attention metadata ahead of the
+  // draft forward with the template's predicted positions so the AI_CPU
+  // metadata compute overlaps the AI_CORE target compute. The draft forward
+  // reuses it when attn_metadata is already populated (all tokens accepted);
+  // repair_host_kv_seq_lens_for_host_metadata resets it to force a rebuild.
+  std::shared_ptr<layer::AttentionMetadata> prebuild_attention_metadata(
+      const torch::Tensor& positions,
+      const ModelInputParams& input_params) {
+    return build_attention_metadata_for_forward(positions, input_params);
+  }
+
  private:
   void align_cache_specs_to_dsv4_managers() {
     // TODO: Remove this hardcoded DSV4 group_infos once the draft can
@@ -649,18 +661,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
       params.multi_block_tables.emplace_back(
           torch::zeros({1, 1}, cpu_int_options));
     }
-  }
-
-  // Eager C-scheme hook: pre-build the DSA attention metadata ahead of the
-  // draft forward with the template's predicted positions so the AI_CPU
-  // metadata compute overlaps the AI_CORE target compute. The draft forward
-  // reuses it when attn_metadata is already populated (all tokens accepted);
-  // repair_host_kv_seq_lens_for_host_metadata clears dsa.metadata_prebuilt to
-  // force a rebuild on rejection.
-  std::shared_ptr<layer::AttentionMetadata> prebuild_attention_metadata(
-      const torch::Tensor& positions,
-      const ModelInputParams& input_params) {
-    return build_attention_metadata_for_forward(positions, input_params);
   }
 
   std::shared_ptr<layer::AttentionMetadata>
