@@ -1681,6 +1681,26 @@ bool MTPWorkerImpl::can_use_combined_first_draft() const {
   return enable_schedule_overlap() && supports_combined_first_draft_execution();
 }
 
+int32_t MTPWorkerImpl::prelaunch_template_increment() const {
+  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  if (draft_impl_ == nullptr) {
+    return num_speculative_tokens;
+  }
+  // DSA builds its metadata from host.kv_seq_lens, so the prebuilt metadata is
+  // only reusable when the template's prediction matches the accepted lengths
+  // exactly. Full acceptance means accepted_length == accepted_tokens.size(1)
+  // == num_speculative_tokens + 1 (the bonus token is one of those columns), so
+  // predicting num_speculative_tokens would only ever hit after exactly one
+  // rejection -- the optimization would fire on the bad path and pay a rebuild
+  // on the good one.
+  if (mtp_async::classify_combined_draft_execution_path(
+          draft_impl_->context_.get_model_args().model_type()) ==
+      mtp_async::CombinedDraftExecutionPath::DEEPSEEK_V4_PAGED_ATTENTION) {
+    return num_speculative_tokens + 1;
+  }
+  return num_speculative_tokens;
+}
+
 void MTPWorkerImpl::prepare_next_first_draft_template(
     const ForwardInput& input,
     ForwardInput& combined_input) {
@@ -1692,7 +1712,10 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
       clone_host_tensor(metadata_template.token_ids_host);
   metadata_template.positions_host =
       clone_host_tensor(metadata_template.positions_host);
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  // positions and kv_seq_lens must move together: prepare_draft_extend_inputs
+  // derives both from the same per-row offset, and the prebuilt DSA metadata
+  // ties the rope cos/sin (positions) to the slot mapping (kv_seq_lens).
+  const int32_t template_increment = prelaunch_template_increment();
   int32_t* template_positions =
       metadata_template.positions_host.data_ptr<int32_t>();
   int32_t* template_tokens =
@@ -1702,8 +1725,8 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
   for (int32_t seq_id = 0;
        seq_id < metadata_template.input_params.meta.num_sequences;
        ++seq_id) {
-    template_positions[seq_id] += num_speculative_tokens;
-    template_kv_lens[seq_id] += num_speculative_tokens;
+    template_positions[seq_id] += template_increment;
+    template_kv_lens[seq_id] += template_increment;
     if (template_tokens[seq_id] < 0) {
       template_tokens[seq_id] = 0;
     }
@@ -1733,8 +1756,8 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
   // attention metadata is built on the eager path inside the draft forward.
   // Pre-build it here from the template's predicted positions so the AI_CPU
   // metadata compute overlaps the AI_CORE target compute. The draft forward
-  // reuses the prebuilt metadata (attn_metadata already populated); on token
-  // rejection the repair step clears dsa.metadata_prebuilt to force a rebuild.
+  // reuses the prebuilt metadata (attn_metadata already populated); when the
+  // prediction misses, the repair step detaches it to force a rebuild.
   prebuild_draft_dsa_metadata(combined_input);
 }
 
@@ -1747,12 +1770,9 @@ void MTPWorkerImpl::prebuild_draft_dsa_metadata(ForwardInput& combined_input) {
       combined_input.positions, combined_input.input_params);
   if (prebuilt) {
     // Attaching the prebuilt metadata is itself the reuse marker: the draft
-    // forward sees a non-null attn_metadata and skips building its own. On
-    // token rejection the repair step clears it (and metadata_prebuilt) so the
-    // draft forward rebuilds with the corrected KV lengths.
-    if (prebuilt->dsa_metadata) {
-      prebuilt->dsa_metadata->metadata_prebuilt = true;
-    }
+    // forward sees a non-null attn_metadata and skips building its own. When
+    // the template's prediction misses, the repair step resets attn_metadata so
+    // the draft forward rebuilds with the corrected KV lengths.
     combined_input.input_params.attn_metadata = std::move(prebuilt);
   }
 }
@@ -1765,7 +1785,9 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
   // prepare_draft_extend_inputs ran with force_two_rows, so the template holds
   // an interleaved [repair, current] pair per sequence.
   constexpr int32_t kRowsPerSequence = 2;
-  bool all_accepted = true;
+  // Whether the template's predicted lengths matched the accepted lengths for
+  // every sequence. Only then is the prebuilt DSA metadata still valid.
+  bool prediction_exact = true;
   if (host_kv_seq_lens.size() !=
       static_cast<size_t>(num_sequences) * kRowsPerSequence) {
     LOG(ERROR) << "unexpected prelaunch host KV length count, expected "
@@ -1795,16 +1817,19 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
   const torch::Tensor accepted_lengths =
       accepted_tokens_host.ge(0).sum(/*dim=*/1).to(torch::kInt);
   const auto lengths = accepted_lengths.accessor<int32_t, 1>();
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  // Same increment the template applied, so delta == 0 means the prediction was
+  // exact. The template predicts full acceptance, i.e. accepted_length ==
+  // num_speculative_tokens + 1.
+  const int32_t template_increment = prelaunch_template_increment();
 
   int32_t kv_max_seq_len = 0;
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    // The template assumed every speculative token was accepted; correct it by
-    // the shortfall. Both rows of a sequence share the same delta because they
-    // are the same sequence one position apart.
-    const int32_t delta = lengths[seq_id] - num_speculative_tokens;
+    // The template assumed full acceptance; correct it by the shortfall. Both
+    // rows of a sequence share the same delta because they are the same
+    // sequence one position apart.
+    const int32_t delta = lengths[seq_id] - template_increment;
     if (delta != 0) {
-      all_accepted = false;
+      prediction_exact = false;
     }
     for (int32_t row = 0; row < kRowsPerSequence; ++row) {
       const size_t idx = static_cast<size_t>(seq_id) * kRowsPerSequence + row;
@@ -1822,9 +1847,10 @@ bool MTPWorkerImpl::repair_host_kv_seq_lens_for_host_metadata(
 
   // Eager C-scheme: the prebuilt metadata assumed full acceptance. If any
   // sequence rejected a token, the corrected host KV lengths differ from the
-  // prediction, so the prebuilt DSA metadata is stale. Detach it and let the
-  // draft forward rebuild with the corrected lengths.
-  if (!all_accepted) {
+  // prediction, so the prebuilt DSA metadata is stale -- and so are its rope
+  // cos/sin, which were gathered at the predicted positions. Detach it and let
+  // the draft forward rebuild both from the corrected state.
+  if (!prediction_exact) {
     combined_input.input_params.attn_metadata.reset();
   }
   return true;

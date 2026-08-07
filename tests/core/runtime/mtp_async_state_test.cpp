@@ -198,6 +198,52 @@ TEST(MtpAsyncStateTest, BuildsMixedAcceptanceStateWithoutHostRoundTrip) {
                            torch::tensor({105, 203, 302}, torch::kLong)));
 }
 
+// The prelaunch template predicts one increment per sequence, and the repair
+// step reuses the prebuilt DSA metadata only when
+// accepted_length - template_increment == 0. Full acceptance is
+// accepted_length == accepted_tokens.size(1) == num_speculative_tokens + 1,
+// because the bonus token occupies one of those columns. A template predicting
+// num_speculative_tokens therefore hits only after exactly one rejection and
+// misses the common full-acceptance path.
+TEST(MtpAsyncStateTest, FullAcceptanceLengthIsNumSpeculativeTokensPlusOne) {
+  constexpr int64_t kNumSpeculativeTokens = 1;
+  // num_spec + 1 columns: [draft token, bonus token].
+  const torch::Tensor accepted_tokens =
+      torch::tensor({{10, 11}, {20, -1}}, torch::kLong);
+  ASSERT_EQ(accepted_tokens.size(1), kNumSpeculativeTokens + 1);
+  const torch::Tensor accepted_embeddings =
+      torch::arange(8, torch::kFloat).reshape({2, 2, 2});
+  const torch::Tensor placeholder = torch::tensor({-100.0, -101.0});
+  const torch::Tensor base_positions = torch::tensor({100, 200});
+  const torch::Tensor base_kv_seq_lens = torch::tensor({101, 201});
+
+  const AcceptedState state = build_accepted_state(accepted_tokens,
+                                                   accepted_embeddings,
+                                                   placeholder,
+                                                   base_positions,
+                                                   base_kv_seq_lens);
+
+  EXPECT_TRUE(torch::equal(state.accepted_lengths,
+                           torch::tensor({2, 1}, torch::kLong)));
+  EXPECT_TRUE(
+      torch::equal(state.all_draft_accepted, torch::tensor({true, false})));
+  EXPECT_TRUE(torch::equal(state.base_kv_seq_lens,
+                           torch::tensor({103, 202}, torch::kLong)));
+
+  const auto lengths = state.accepted_lengths.accessor<int64_t, 1>();
+  constexpr int64_t kTemplateIncrement = kNumSpeculativeTokens + 1;
+  // Sequence 0 accepted everything: the prediction is exact, so the prebuilt
+  // metadata stays valid.
+  EXPECT_EQ(lengths[0] - kTemplateIncrement, 0);
+  // Sequence 1 rejected the draft token: the prediction overshoots and the
+  // prebuilt metadata must be discarded.
+  EXPECT_EQ(lengths[1] - kTemplateIncrement, -1);
+  // Regression guard: keying the predicate on num_speculative_tokens inverts
+  // it, firing on rejection and rebuilding on full acceptance.
+  EXPECT_NE(lengths[0] - kNumSpeculativeTokens, 0);
+  EXPECT_EQ(lengths[1] - kNumSpeculativeTokens, 0);
+}
+
 TEST(MtpAsyncStateTest, BuildsRowMetadataForChunkedAndDecodeLayouts) {
   AcceptedState state;
   state.base_positions = torch::tensor({104, 202, 301}, torch::kLong);

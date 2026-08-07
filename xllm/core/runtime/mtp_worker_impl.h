@@ -179,22 +179,31 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void flush_pending_target_context();
   bool supports_combined_first_draft_execution() const;
   bool can_use_combined_first_draft() const;
+  // Position/KV-length increment the prelaunch template applies per sequence.
+  // Models whose DSA metadata is prebuilt from the template predict the
+  // fully-accepted case (accepted_length == num_speculative_tokens + 1, the
+  // width of accepted_tokens) so the prediction is exact on the common path and
+  // the prebuilt metadata survives. Other models keep the conservative
+  // num_speculative_tokens increment: the fused kernel overwrites every device
+  // tensor, so the template value only fixes tensor shapes there.
+  int32_t prelaunch_template_increment() const;
   void prepare_next_first_draft_template(const ForwardInput& input,
                                          ForwardInput& combined_input);
   // Eager C-scheme: pre-build the draft's DSA attention metadata from the
   // template's predicted positions so the AI_CPU metadata compute overlaps the
   // AI_CORE target compute (the draft is not graph-captured). Cleared by
-  // repair_host_kv_seq_lens_for_host_metadata on token rejection.
+  // repair_host_kv_seq_lens_for_host_metadata when the prediction misses.
   void prebuild_draft_dsa_metadata(ForwardInput& combined_input);
   void enqueue_next_first_draft(const ForwardInput& input,
                                 const SampleOutput& validate_output,
                                 const torch::Tensor& base_positions,
                                 const torch::Tensor& base_kv_seq_lens,
                                 ForwardInput combined_input);
-  // Repairs the optimistic host KV lengths baked into the prelaunch template
-  // for models that build attention metadata on the host (DSA). Returns false
-  // when the accepted lengths could not be read, meaning the caller must not
-  // launch the prelaunched draft.
+  // Corrects the predicted host KV lengths baked into the prelaunch template
+  // for models that build attention metadata on the host (DSA), and drops the
+  // prebuilt metadata when the prediction missed. Returns false when the
+  // accepted lengths could not be read, meaning the caller must not launch the
+  // prelaunched draft.
   bool repair_host_kv_seq_lens_for_host_metadata(int32_t num_sequences,
                                                  ForwardInput& combined_input);
   bool pending_draft_context_matches(const ForwardInput& input) const;
