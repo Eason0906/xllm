@@ -651,7 +651,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     }
   }
 
-  std::shared_ptr<layer::AttentionMetadata>
   // Eager C-scheme hook: pre-build the DSA attention metadata ahead of the
   // draft forward with the template's predicted positions so the AI_CPU
   // metadata compute overlaps the AI_CORE target compute. The draft forward
