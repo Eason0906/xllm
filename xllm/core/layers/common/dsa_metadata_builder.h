@@ -42,7 +42,11 @@ class DSAMetadataBuilder {
   //
   //   params: batch-level model input params
   //   positions: token position IDs tensor
-  //   dsa_cos_sin: precomputed RoPE cos/sin table (optional, can be undefined)
+  //   dsa_cos_sin: base RoPE cos/sin table. Currently unused, like
+  //     dsa_c4_cos_sin / dsa_c128_cos_sin: on NPU the per-forward cos/sin are
+  //     built from the rotary embedding in build_dsa_rope_metadata, not sliced
+  //     out of this table. Kept in the signature for the callers that already
+  //     hold it.
   //   caches_info: per-layer cache specs [layer_id][cache_idx]
   //   group_infos: per-group info [group_id]
   static AttentionMetadata build(

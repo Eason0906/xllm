@@ -106,6 +106,12 @@ AttentionMetadata DSAMetadataBuilder::build(
     dsa_metadata->attn_mask = attn_metadata.attn_mask.clone();
   }
 
+  // build_dsa_fields no longer defines cos_table/sin_table, so these fall back
+  // to the mrope tables whenever AttentionMetadataBuilder supplies them. It
+  // does not today -- nothing in it writes mrope_cos/mrope_sin, and the sole
+  // writer in the tree (musa/qwen3.h) does not reach this builder -- so in
+  // practice this stays a no-op. Kept as-is because it is the documented
+  // fallback for models that do carry mrope tables.
   if (attn_metadata.mrope_cos.defined() && !dsa_metadata->cos_table.defined()) {
     dsa_metadata->cos_table = attn_metadata.mrope_cos;
   }
@@ -151,18 +157,23 @@ void DSAMetadataBuilder::build_dsa_fields(
     q_lens_vec.assign(batch_size, 1);
   }
 
-  // Keep base RoPE tables in metadata. Per-forward cos/sin slices are
-  // calculated in DeepseekV4ModelImpl::forward to align with MindIE timing.
-  if (dsa_cos_sin.defined()) {
-    auto cos_sin_chunks = dsa_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
-    dsa.cos_table = cos_sin_chunks[0].contiguous();
-    dsa.sin_table = cos_sin_chunks[1].contiguous();
-  }
-
   if (positions.defined()) {
     build_positions(params, batch_size, dsa);
   }
 
+  // cos_table / sin_table are deliberately left undefined here. This builder is
+  // the NPU path, and on NPU nothing reads them: per-forward cos/sin come from
+  // dsa_rotary_embedding_->build(positions_map) in build_dsa_rope_metadata. The
+  // only readers are MLU kernels, and MLU has its own builder
+  // (DSAMetadataBuilderMlu) plus its own init-time assignment, so it never
+  // relies on these.
+  //
+  // Splitting dsa_cos_sin here used to cost two full copies of the base RoPE
+  // table per build: chunk() along the last dim yields strided views, so
+  // .contiguous() materialized the whole [max_position_embeddings, rope_dim/2]
+  // table twice. Measured on DSV4-Flash (1M context) that was 339 us per copy,
+  // ~1.36 ms per MTP step, for values no kernel consumed.
+  (void)dsa_cos_sin;
   (void)dsa_c4_cos_sin;
   (void)dsa_c128_cos_sin;
 

@@ -171,5 +171,44 @@ TEST_F(DeepseekV4IndexerTest, DsaDummyAttentionUsesPositionDevice) {
                            torch::tensor({1}, torch::kInt32)));
 }
 
+TEST_F(DeepseekV4IndexerTest, DsaBuildDoesNotMaterializeBaseRopeTables) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = 1;
+  params.attention.host.kv_seq_lens = {5};
+  params.attention.host.q_seq_lens = {1};
+  params.meta.q_max_seq_len = 1;
+  params.meta.kv_max_seq_len = 5;
+  params.attention.device.new_cache_slots = torch::tensor({4}, torch::kInt32);
+  params.multi_block_tables = {
+      torch::tensor({{0}}, torch::kInt32),
+  };
+
+  const auto positions = torch::tensor({4}, torch::kInt64);
+  const std::vector<DSAGroupInfo> group_infos = {
+      {DSACacheType::SLIDING_WINDOW, 1, 128},
+  };
+  const std::vector<std::vector<DSACacheInfo>> caches_info = {{
+      {0, DSACacheType::SLIDING_WINDOW, 1, 128},
+  }};
+
+  // A defined base RoPE table, laid out like the real one: cos and sin
+  // concatenated along the last dim.
+  const auto dsa_cos_sin = torch::ones({64, 128}, torch::kFloat32);
+
+  auto metadata = DSAMetadataBuilder::build(
+      params, positions, dsa_cos_sin, caches_info, group_infos);
+
+  ASSERT_TRUE(metadata.dsa_metadata != nullptr);
+  const auto& dsa = *metadata.dsa_metadata;
+  // Regression guard: splitting the base table here materialized two full
+  // copies of it per build (chunk() yields strided views, so .contiguous()
+  // copied the whole thing) for fields no NPU kernel reads. Per-forward cos/sin
+  // come from the rotary embedding in build_dsa_rope_metadata instead, and the
+  // only readers of these fields are MLU kernels fed by MLU's own builder.
+  EXPECT_FALSE(dsa.cos_table.defined());
+  EXPECT_FALSE(dsa.sin_table.defined());
+}
+
 }  // namespace layer
 }  // namespace xllm
