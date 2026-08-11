@@ -493,6 +493,23 @@ struct GroupGemmParams {
   std::optional<torch::Tensor> combine_idx;
 };
 
+// Fused routed-expert grouped matmul + dequant + SwiGLU + dynamic int8 quant
+// (aclnnGroupedMatmulSwigluQuantWeightNzV2, int8 A8W8 pertoken path).
+struct GroupedMatmulSwigluQuantV2Params {
+  // INT8 input activation [num_tokens M, hidden K], ND.
+  torch::Tensor x;
+  // INT8 expert weight [num_experts E, K, 2N], must be FRACTAL_NZ.
+  torch::Tensor weight;
+  // FP32 per-channel weight dequant scale [E, 2N].
+  torch::Tensor weight_scale;
+  // FP32 per-token input dequant scale [M].
+  torch::Tensor x_scale;
+  // INT64 per-expert token COUNTS [E]. Passed to
+  // aclnnGroupedMatmulSwigluQuantWeightNzV2 with groupListType=1, so no
+  // host-side cumsum is needed.
+  torch::Tensor group_list;
+};
+
 struct DequantSwigluQuantParams {
   // Input tensor from grouped matmul output.
   // Typical dtype for W8A8 path: int32.

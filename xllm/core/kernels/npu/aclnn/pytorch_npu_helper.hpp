@@ -404,6 +404,30 @@ inline aclTensor* convert_type(const at::Tensor& at_tensor) {
       format = ACL_FORMAT_ND;
   }
 
+  // Private-format (e.g. FRACTAL_NZ) awareness. The generic path above encodes
+  // storage as a flat 1D shape and derives the ACL format from the view rank,
+  // which is wrong for NZ tensors: aclnn ops such as
+  // aclnnGroupedMatmulSwigluQuantWeightNZ validate that the weight's storage
+  // shape is the 5D NZ layout [E, 2N/32, K/16, 16, 32]. For NPU tensors whose
+  // real storage format is NZ, read the true storage_sizes_ / npu_format_ from
+  // the NPU storage descriptor. ND tensors are left on the original 1D path so
+  // no other op's behavior changes.
+  if (!at_tensor.device().is_cpu()) {
+    auto* npu_storage = static_cast<torch_npu::NPUStorageImpl*>(
+        at_tensor.storage().unsafeGetStorageImpl());
+    if (npu_storage != nullptr) {
+      const auto npu_format =
+          static_cast<aclFormat>(npu_storage->npu_desc_.npu_format_);
+      if (npu_format == ACL_FORMAT_FRACTAL_NZ) {
+        format = npu_format;
+        storage_dims.clear();
+        for (const auto storage_dim : npu_storage->npu_desc_.storage_sizes_) {
+          storage_dims.push_back(storage_dim);
+        }
+      }
+    }
+  }
+
   if (at_tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
     c10::Scalar exp_scalar = convert_tensor_to_scalar(at_tensor);
     at::Tensor acl_input = copy_scalar_to_device(exp_scalar, scalar_data_type);

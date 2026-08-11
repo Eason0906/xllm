@@ -75,7 +75,8 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& router_logits,
       const std::optional<torch::Tensor>& shared_output,
       const ModelInputParams& input_params,
-      bool use_mega_moe);
+      bool use_mega_moe,
+      bool no_decode_phase = true);
   torch::Tensor forward_with_selected_experts(
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
@@ -154,6 +155,8 @@ class FusedMoEImpl : public torch::nn::Module {
   bool w4a8_dynamic_preprocessed_ = false;
   bool w13_group_gemm_layout_prepared_ = false;
   bool w2_group_gemm_layout_prepared_ = false;
+  // w13_ cast to FRACTAL_NZ for the fused grouped_matmul_swiglu_quant_v2 op.
+  bool w13_swiglu_v2_nz_prepared_ = false;
 
   ReplicatedLinear gate_{nullptr};
   Activation act_{nullptr};

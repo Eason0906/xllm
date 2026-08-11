@@ -63,6 +63,11 @@ torch::Tensor group_gemm(GroupGemmParams& params);
 std::tuple<torch::Tensor, torch::Tensor> dequant_swiglu_quant(
     DequantSwigluQuantParams& params);
 
+std::tuple<torch::Tensor, torch::Tensor> grouped_matmul_swiglu_quant_v2(
+    GroupedMatmulSwigluQuantV2Params& params);
+
+bool grouped_matmul_swiglu_quant_v2_available();
+
 std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,

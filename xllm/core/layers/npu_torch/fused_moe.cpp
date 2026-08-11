@@ -19,9 +19,11 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1921,7 +1923,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
     const torch::Tensor& router_logits,
     const std::optional<torch::Tensor>& shared_output,
     const ModelInputParams& input_params,
-    bool use_mega_moe) {
+    bool use_mega_moe,
+    bool no_decode_phase) {
   if (use_mega_moe) {
     return forward_mega_moe(hidden_states, router_logits, shared_output);
   }
@@ -1937,6 +1940,59 @@ torch::Tensor FusedMoEImpl::forward_expert(
   SelectedExpertInfo selected_expert_info;
   torch::Tensor expand_hidden_states = select_experts(
       hidden_states_2d, router_logits_2d, selected_expert_info, input_params);
+
+  // Optional per-expert token-count logging for routing-distribution / M_e
+  // analysis. token_count_slice[e] is the number of tokens routed to local
+  // expert e this call; its sum is M (the grouped-matmul row count).
+  //
+  // Gated by env XLLM_LOG_MOE_GROUPLIST:
+  //   unset / 0 / n            -> OFF
+  //   1 / t / y                -> log EVERY forward_expert call (all phases)
+  //   prefill / p / 2          -> log ONLY prefill calls (no_decode phase:
+  //                               PREFILL or CHUNKED_PREFILL), skip decode
+  // The prefill-only mode is meant for profile correlation on the prefill
+  // stage, where M is large enough for the fused op to matter; it keeps the
+  // log short (one line per MoE layer of the single prefill forward).
+  //
+  // Every logged call is tagged with a monotonic call# so each line maps 1:1
+  // to the corresponding grouped-matmul invocation in a profiler trace: the
+  // k-th logged call# is the k-th grouped_matmul_swiglu_quant_v2 op in the
+  // profile. counts are printed on a single line ([a, b, c, ...]).
+  //
+  // WARNING: printing forces a device->host copy (stream sync) on every logged
+  // call, which serializes the pipeline and destroys perf numbers. Use this
+  // ONLY for analysis. Leave it OFF during benchmarks.
+  enum class MoeLogMode { kOff, kAll, kPrefillOnly };
+  static const MoeLogMode moe_log_mode = [] {
+    const char* v = std::getenv("XLLM_LOG_MOE_GROUPLIST");
+    if (v == nullptr) return MoeLogMode::kOff;
+    if (v[0] == 'p' || v[0] == 'P' || v[0] == '2')
+      return MoeLogMode::kPrefillOnly;
+    if (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')
+      return MoeLogMode::kAll;
+    return MoeLogMode::kOff;
+  }();
+  const bool log_moe_grouplist =
+      (moe_log_mode == MoeLogMode::kAll) ||
+      (moe_log_mode == MoeLogMode::kPrefillOnly && no_decode_phase);
+  if (log_moe_grouplist) {
+    static std::atomic<int64_t> moe_call_counter{0};
+    const int64_t call_id = moe_call_counter.fetch_add(1);
+    auto counts = selected_expert_info.token_count_slice.to(torch::kCPU);
+    const int64_t n = counts.numel();
+    const auto* cptr = counts.data_ptr<int64_t>();
+    int64_t m_total = 0;
+    std::string counts_str = "[";
+    for (int64_t i = 0; i < n; ++i) {
+      m_total += cptr[i];
+      counts_str += std::to_string(cptr[i]);
+      if (i + 1 < n) counts_str += ", ";
+    }
+    counts_str += "]";
+    LOG(INFO) << "[FusedMoE] call#" << call_id
+              << " per-expert token_count (M=" << m_total << ", experts=" << n
+              << "): " << counts_str;
+  }
 
   torch::Tensor gemm1_out;
   torch::Tensor gemm2_out;
@@ -1963,31 +2019,89 @@ torch::Tensor FusedMoEImpl::forward_expert(
                                     local_intermediate_size_ * 2,
                                     "w13");
 
-    // Step 5-6: first grouped matmul + dequant + swiglu + quant.
+    // Step 5-6: routed-expert grouped matmul + dequant + SwiGLU + quant.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
-    std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
-    std::vector<torch::Tensor> weight_list = {w13_};
-    xllm::kernel::GroupGemmParams group_gemm_params;
-    group_gemm_params.x_list = torch::TensorList(x_list);
-    group_gemm_params.weight_list = torch::TensorList(weight_list);
-    group_gemm_params.group_list = selected_expert_info.token_count_slice;
-    group_gemm_params.split_item = 2;
-    group_gemm_params.group_type = 0;
-    group_gemm_params.group_list_type = 1;
-    group_gemm_params.output_dtype = torch::kInt32;
-    gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
+    // The fused V2 aclnn (aclnnGroupedMatmulSwigluQuantWeightNzV2) takes NO
+    // swigluLimit argument -- verified against the CANN 9.0.0 proto, the aclnn
+    // header, and the device kernel (grouped_matmul_swiglu_quant_spilit_fusion.h
+    // computes silu directly with no clamp, per-token scale = max(|swiglu|)*127).
+    // DeepSeek V4 requires a non-zero SwiGLU clamp (default 10.0, enforced >0 by
+    // deepseek_v4 validate_args) to saturate outlier activations before the
+    // per-token int8 quant; without it those outliers inflate the quant scale
+    // and crush the dynamic range of normal values. So the fused path must NOT
+    // run when an effective clamp is configured -- take it only when no clamp
+    // is set, else use the fallback (which does honour the clamp).
+    const bool v2_available =
+        xllm::kernel::grouped_matmul_swiglu_quant_v2_available();
+    const bool fused_v2_usable =
+        v2_available && !has_effective_swiglu_limit(swiglu_limit_);
+    // A/B override: force the (clamp-less) fused path on even for V4, to
+    // measure the clamp's numerical impact. Requires the symbol to be present.
+    static const bool force_fused_v2 = [] {
+      const char* v = std::getenv("XLLM_FORCE_GMM_SWIGLU_QUANT_V2");
+      return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' ||
+                   v[0] == 'y' || v[0] == 'Y');
+    }();
+    if (fused_v2_usable || (force_fused_v2 && v2_available)) {
+      LOG_FIRST_N(INFO, 1)
+          << "[FusedMoE] Using FUSED grouped_matmul_swiglu_quant_v2 "
+             "(aclnnGroupedMatmulSwigluQuantWeightNzV2) path"
+          << (force_fused_v2 ? " [FORCED, no clamp -- A/B only]" : "");
+      // Fused fast-path: one aclnnGroupedMatmulSwigluQuantWeightNzV2 call
+      // replaces the group_gemm + dequant_swiglu_quant pair.
+      // Requirements: w13_ in FRACTAL_NZ (NZ-cast once), and group_list as
+      // int64 per-expert COUNTS (groupListType=1) -- no cumsum needed.
+      if (!w13_swiglu_v2_nz_prepared_) {
+        // w13_ was transposed to [E,K,2N] by ensure_group_gemm_weight_layout
+        // above, which yields a NON-contiguous view. npu_format_cast to
+        // FRACTAL_NZ must run on a contiguous tensor, otherwise the NZ storage
+        // is not the 5D [E,2N/32,K/16,16,32] the op requires (it collapses to
+        // a flat 1D storage and the op rejects it). Mirror the proven mc2
+        // preparation order: make contiguous, then NZ-cast.
+        ensure_contiguous_for_fused_mc2(w13_);
+        empty_cache_for_tensor(w13_);
+        maybe_trans_nz(w13_);
+        w13_swiglu_v2_nz_prepared_ = true;
+      }
+      // WeightNzV2 takes group_list as raw per-expert COUNTS (groupListType=1),
+      // so NO host-side cumsum is needed. token_count_slice is already int64.
+      xllm::kernel::GroupedMatmulSwigluQuantV2Params fused_params;
+      fused_params.x = quantized_expand_hidden_states;
+      fused_params.weight = w13_;
+      fused_params.weight_scale = w13_scale_;
+      fused_params.x_scale = pertoken_scale.value();
+      fused_params.group_list = selected_expert_info.token_count_slice;
+      std::tie(act_quantized, act_scale) =
+          xllm::kernel::grouped_matmul_swiglu_quant_v2(fused_params);
+    } else {
+      LOG_FIRST_N(INFO, 1)
+          << "[FusedMoE] Using FALLBACK group_gemm + dequant_swiglu_quant "
+             "path (clamp required, fused v2 unavailable or disabled via env)";
+      // Fallback: separate group_gemm (int32) + dequant_swiglu_quant.
+      std::vector<torch::Tensor> x_list = {quantized_expand_hidden_states};
+      std::vector<torch::Tensor> weight_list = {w13_};
+      xllm::kernel::GroupGemmParams group_gemm_params;
+      group_gemm_params.x_list = torch::TensorList(x_list);
+      group_gemm_params.weight_list = torch::TensorList(weight_list);
+      group_gemm_params.group_list = selected_expert_info.token_count_slice;
+      group_gemm_params.split_item = 2;
+      group_gemm_params.group_type = 0;
+      group_gemm_params.group_list_type = 1;
+      group_gemm_params.output_dtype = torch::kInt32;
+      gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
 
-    xllm::kernel::DequantSwigluQuantParams params;
-    params.x = gemm1_out;
-    params.weight_scale = w13_scale_;
-    params.activation_scale = pertoken_scale.value();
-    params.group_index = selected_expert_info.token_count_slice;
-    params.activate_left = true;
-    params.quant_mode = 1;
-    apply_ds_v4_dequant_swiglu_quant_v2_params(params, swiglu_limit_);
-    std::tie(act_quantized, act_scale) =
-        xllm::kernel::dequant_swiglu_quant(params);
+      xllm::kernel::DequantSwigluQuantParams params;
+      params.x = gemm1_out;
+      params.weight_scale = w13_scale_;
+      params.activation_scale = pertoken_scale.value();
+      params.group_index = selected_expert_info.token_count_slice;
+      params.activate_left = true;
+      params.quant_mode = 1;
+      apply_ds_v4_dequant_swiglu_quant_v2_params(params, swiglu_limit_);
+      std::tie(act_quantized, act_scale) =
+          xllm::kernel::dequant_swiglu_quant(params);
+    }
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
     ensure_group_gemm_weight_layout(w2_,
@@ -2220,8 +2334,13 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   auto router_logits = gate_(input);
   const bool use_mega_moe =
       mega_moe_enabled_ && input.size(0) <= kMegaMoeMaxTokens;
-  auto output = forward_expert(
-      input, router_logits, shared_output, input_params, use_mega_moe);
+  auto output =
+      forward_expert(input,
+                     router_logits,
+                     shared_output,
+                     input_params,
+                     use_mega_moe,
+                     input_params.meta.batch_forward_type.no_decode());
 
   if (need_slice) {
     const int64_t dp_rank = parallel_args_.dp_local_process_group_->rank();
@@ -2779,8 +2898,13 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   torch::Tensor router_logits = torch::empty(router_shape, input.options());
   const bool use_mega_moe =
       mega_moe_enabled_ && input.size(0) <= kMegaMoeMaxTokens;
-  torch::Tensor output = forward_expert(
-      input, router_logits, shared_output, input_params, use_mega_moe);
+  torch::Tensor output =
+      forward_expert(input,
+                     router_logits,
+                     shared_output,
+                     input_params,
+                     use_mega_moe,
+                     input_params.meta.batch_forward_type.no_decode());
   preselected_experts_ = std::nullopt;
 
   if (need_slice) {
